@@ -1,0 +1,197 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>弹幕屏幕</title>
+  <style>
+    :root {
+      --bg-top: #0f172a;
+      --bg-bottom: #1e293b;
+      --stroke: rgba(255, 255, 255, 0.14);
+      --text: #e2e8f0;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: linear-gradient(180deg, var(--bg-top), var(--bg-bottom));
+      font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+      color: var(--text);
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0;
+      overflow: hidden;
+      background-image: radial-gradient(circle at 12% 20%, rgba(96, 165, 250, 0.16), transparent 30%),
+                        radial-gradient(circle at 80% 65%, rgba(192, 132, 252, 0.16), transparent 35%);
+    }
+
+    .track {
+      position: absolute;
+      left: 0;
+      width: 100%;
+      border-top: 1px dashed transparent;
+    }
+
+    .dm {
+      position: absolute;
+      right: -10px;
+      white-space: nowrap;
+      user-select: none;
+      will-change: transform;
+      font-size: 32px;
+      line-height: 1;
+      font-weight: 700;
+      text-shadow:
+        0 1px 0 rgba(0, 0, 0, 0.45),
+        0 2px 8px rgba(0, 0, 0, 0.45),
+        0 0 1px rgba(0, 0, 0, 0.75);
+      pointer-events: none;
+      opacity: 0.97;
+    }
+
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      font-size: 13px;
+      background: rgba(15, 23, 42, 0.58);
+      border: 1px solid var(--stroke);
+      border-radius: 999px;
+      padding: 6px 12px;
+      backdrop-filter: blur(4px);
+      z-index: 10;
+    }
+
+    #hud b { color: #86efac; }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="hud">状态: <b id="conn">连接中</b></div>
+
+  <script>
+    const stage = document.getElementById("stage");
+    const connEl = document.getElementById("conn");
+
+    const TRACK_HEIGHT = 46;
+    const TOP_PADDING = 18;
+    const FONT_MIN = 26;
+    const FONT_MAX = 42;
+
+    let tracks = [];
+
+    function randomSize() {
+      return Math.floor(Math.random() * (FONT_MAX - FONT_MIN + 1)) + FONT_MIN;
+    }
+
+    function buildTracks() {
+      stage.innerHTML = "";
+      const available = Math.max(1, Math.floor((window.innerHeight - TOP_PADDING * 2) / TRACK_HEIGHT));
+      tracks = Array.from({ length: available }, (_, idx) => ({
+        y: TOP_PADDING + idx * TRACK_HEIGHT,
+        busyUntil: 0,
+      }));
+
+      for (let i = 0; i < available; i++) {
+        const line = document.createElement("div");
+        line.className = "track";
+        line.style.top = `${TOP_PADDING + i * TRACK_HEIGHT + TRACK_HEIGHT - 8}px`;
+        stage.appendChild(line);
+      }
+    }
+
+    function pickTrack(now = performance.now()) {
+      let best = 0;
+      let minBusy = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < tracks.length; i++) {
+        if (tracks[i].busyUntil <= now) return i;
+        if (tracks[i].busyUntil < minBusy) {
+          minBusy = tracks[i].busyUntil;
+          best = i;
+        }
+      }
+      return best;
+    }
+
+    function shoot(msg) {
+      const text = (msg.text || "").trim();
+      if (!text) return;
+
+      const speed = Math.min(240, Math.max(40, Number(msg.speed) || 90));
+      const color = /^#[0-9a-fA-F]{6}$/.test(msg.color || "") ? msg.color : "#ffffff";
+      const fontSize = randomSize();
+
+      const node = document.createElement("div");
+      node.className = "dm";
+      node.textContent = text;
+      node.style.color = color;
+      node.style.fontSize = `${fontSize}px`;
+
+      const now = performance.now();
+      const idx = pickTrack(now);
+      node.style.top = `${tracks[idx].y}px`;
+      stage.appendChild(node);
+
+      const width = node.getBoundingClientRect().width;
+      const totalDistance = window.innerWidth + width + 40;
+      const duration = (totalDistance / speed) * 1000;
+
+      const gapDistance = width + 80;
+      tracks[idx].busyUntil = now + (gapDistance / speed) * 1000;
+
+      const anim = node.animate(
+        [
+          { transform: `translateX(${width + 30}px)` },
+          { transform: `translateX(-${window.innerWidth + 60}px)` },
+        ],
+        {
+          duration,
+          easing: "linear",
+          fill: "forwards",
+        }
+      );
+
+      anim.onfinish = () => node.remove();
+    }
+
+    function connect() {
+      const protocol = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${protocol}://${location.host}/ws`);
+
+      ws.onopen = () => {
+        connEl.textContent = "已连接";
+        connEl.style.color = "#86efac";
+      };
+
+      ws.onclose = () => {
+        connEl.textContent = "已断开，重连中";
+        connEl.style.color = "#fca5a5";
+        setTimeout(connect, 1200);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          shoot(data);
+        } catch (_) {
+        }
+      };
+    }
+
+    buildTracks();
+    connect();
+    window.addEventListener("resize", buildTracks);
+  </script>
+</body>
+</html>
