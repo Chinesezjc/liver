@@ -40,6 +40,44 @@ cargo run -- --overlay
 
 如果只运行服务端（`--server`），不会进入显示器选择交互。
 
+## 内网穿透（跨网络访问）
+
+推荐使用 Cloudflare Tunnel，把本机 `3000` 端口映射成公网 HTTPS 地址。
+
+### 1) 安装 cloudflared
+
+- Windows: `winget install --id Cloudflare.cloudflared -e`
+- macOS: `brew install cloudflared`
+
+### 2) 主程序内置 Tunnel 逻辑
+
+默认启动时会询问是否开启 Tunnel。  
+可通过参数控制：
+
+- `--tunnel`：强制开启，不询问
+- `--no-tunnel`：强制关闭，不询问
+- `--edge-ip-version 4|6|auto`：指定 tunnel 使用 IPv4/IPv6（默认 `auto` 自动判定）
+
+示例：
+
+```bash
+cargo run -- --server --tunnel
+cargo run -- --all --no-tunnel
+cargo run -- --server --tunnel --edge-ip-version 4
+```
+
+### 3) 打开 client
+
+脚本启动后，终端会打印一个类似：
+
+`https://xxxx.trycloudflare.com`
+
+在任意设备浏览器打开：
+
+`https://xxxx.trycloudflare.com/client`
+
+即可发送弹幕到你本地服务端。
+
 ## 页面与接口
 
 - 发送端网页：`http://127.0.0.1:3000/client`
@@ -60,3 +98,8 @@ cargo run -- --overlay
 - `text`：必填，最多 120 字符
 - `color`：可选，`#RRGGBB`
 - `speed`：可选，40-240（像素/秒）
+
+## 致谢
+
+- 感谢 **Qiuly** 进行 macOS 系统环境测试。
+- 感谢 **Cloudflare** 提供 Tunnel 服务支持。

@@ -1,8 +1,11 @@
 ﻿use std::{
+    env,
     fs,
-    io::{self, Write},
-    net::SocketAddr,
-    sync::{mpsc, Arc},
+    io::{self, BufRead, BufReader, Write},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::{atomic::AtomicBool, mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -24,7 +27,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_tungstenite::connect_async;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+static DNS_HINT_PRINTED: AtomicBool = AtomicBool::new(false);
+static TUNNEL_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct AppState {
@@ -58,12 +64,28 @@ enum RunMode {
     All,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TunnelPreference {
+    Ask,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy)]
+enum EdgeIpPreference {
+    Auto,
+    V4,
+    V6,
+}
+
 #[derive(Clone, Copy)]
 struct AppConfig {
     mode: RunMode,
     port: u16,
     monitor_index: Option<i32>,
     list_monitors: bool,
+    tunnel_preference: TunnelPreference,
+    edge_ip_preference: EdgeIpPreference,
 }
 
 #[derive(Clone, Debug)]
@@ -79,9 +101,12 @@ struct MonitorSpec {
 }
 
 fn main() {
+    enable_utf8_console();
+
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "liver=info,tower_http=info".to_string()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "liver=info,cloudflared=info,tower_http=info".to_string()),
         )
         .init();
 
@@ -101,17 +126,31 @@ fn main() {
             error!("no monitor found; overlay may fail to start");
         } else {
             log_monitors(&monitors);
-            selected_monitor_index = prompt_monitor_index(&monitors);
+            if selected_monitor_index.is_none() {
+                selected_monitor_index = prompt_monitor_index(&monitors);
+            }
         }
     } else if config.list_monitors {
         log_monitors(&monitors);
     }
 
     let overlay_enabled = selected_monitor_index != Some(-1);
+    let tunnel_enabled = resolve_tunnel_enabled(config.mode, config.tunnel_preference);
 
     match config.mode {
-        RunMode::Server => run_server_blocking(config.port),
+        RunMode::Server => {
+            if tunnel_enabled {
+                let port = config.port;
+                let edge_pref = config.edge_ip_preference;
+                thread::spawn(move || run_cloudflared_blocking(port, edge_pref));
+                thread::sleep(Duration::from_secs(1));
+            }
+            run_server_blocking(config.port)
+        }
         RunMode::Overlay => {
+            if tunnel_enabled {
+                warn!("tunnel is ignored in --overlay mode because server is not started");
+            }
             if overlay_enabled {
                 run_overlay_blocking(config.port, selected_monitor_index, &monitors)
             } else {
@@ -124,7 +163,12 @@ fn main() {
             let monitors_for_overlay = monitors.clone();
             let server_thread = thread::spawn(move || run_server_blocking(port));
             // Give the server a short head start before websocket connect attempts.
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_secs(2));
+            if tunnel_enabled {
+                let tunnel_port = port;
+                let edge_pref = config.edge_ip_preference;
+                thread::spawn(move || run_cloudflared_blocking(tunnel_port, edge_pref));
+            }
             if overlay_enabled {
                 run_overlay_blocking(port, monitor_index, &monitors_for_overlay);
             } else {
@@ -142,6 +186,8 @@ fn parse_args() -> AppConfig {
     let mut monitor_index = None;
     let mut list_monitors = false;
     let mut port = 3000u16;
+    let mut tunnel_preference = TunnelPreference::Ask;
+    let mut edge_ip_preference = EdgeIpPreference::Auto;
     let mut args = std::env::args().skip(1).peekable();
 
     while let Some(arg) = args.next() {
@@ -149,6 +195,20 @@ fn parse_args() -> AppConfig {
             "--server" => mode = RunMode::Server,
             "--overlay" => mode = RunMode::Overlay,
             "--all" => mode = RunMode::All,
+            "--tunnel" => tunnel_preference = TunnelPreference::Always,
+            "--no-tunnel" => tunnel_preference = TunnelPreference::Never,
+            "--edge-ip-version" => {
+                if let Some(v) = args.next() {
+                    match v.as_str() {
+                        "4" => edge_ip_preference = EdgeIpPreference::V4,
+                        "6" => edge_ip_preference = EdgeIpPreference::V6,
+                        "auto" => edge_ip_preference = EdgeIpPreference::Auto,
+                        _ => error!("invalid --edge-ip-version value: {} (use 4/6/auto)", v),
+                    }
+                } else {
+                    error!("missing value for --edge-ip-version");
+                }
+            }
             "--monitor" => {
                 if let Some(v) = args.next() {
                     match v.parse::<i32>() {
@@ -179,6 +239,8 @@ fn parse_args() -> AppConfig {
         port,
         monitor_index,
         list_monitors,
+        tunnel_preference,
+        edge_ip_preference,
     }
 }
 
@@ -191,6 +253,272 @@ fn run_server_blocking(port: u16) {
     runtime
         .block_on(run_server(port))
         .expect("server runtime failed");
+}
+
+fn run_cloudflared_blocking(port: u16, edge_pref: EdgeIpPreference) {
+    if !command_exists("cloudflared") {
+        error!("cloudflared not found. Install it first:");
+        error!("  Windows: winget install --id Cloudflare.cloudflared -e");
+        error!("  macOS:   brew install cloudflared");
+        return;
+    }
+    let edge_ip_version = match choose_edge_ip_version(edge_pref) {
+        Ok(v) => v,
+        Err(msg) => {
+            warn!("tunnel precheck failed: {}", msg);
+            warn!("建议操作:");
+            warn!("1) 先强制 IPv4: 加参数 --edge-ip-version 4");
+            warn!("2) 验证 DNS: Resolve-DnsName region1.v2.argotunnel.com");
+            warn!("3) 验证端口: Test-NetConnection region1.v2.argotunnel.com -Port 7844");
+            warn!("4) 若 DNS 失败，改为可达 DNS（如 8.8.8.8）并执行 ipconfig /flushdns");
+            warn!("将继续尝试启动 cloudflared，默认使用 IPv4...");
+            "4"
+        }
+    };
+    info!("cloudflared edge-ip-version={}", edge_ip_version);
+
+    info!("starting cloudflared quick tunnel for http://127.0.0.1:{}", port);
+    info!("if created, open client at: https://<random>.trycloudflare.com/client");
+    let origin_cert = find_existing_origin_cert();
+    if let Some(path) = origin_cert.as_ref() {
+        info!("using origin cert: {}", path.display());
+    } else {
+        info!("no origin cert found, continue with quick tunnel (no login)");
+    }
+
+    let mut cmd = Command::new("cloudflared");
+    cmd.arg("tunnel")
+        .arg("--url")
+        .arg(format!("http://127.0.0.1:{}", port))
+        .arg("--protocol")
+        .arg("http2")
+        .arg("--edge-ip-version")
+        .arg(edge_ip_version)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(path) = origin_cert.as_ref() {
+        cmd.arg("--origincert").arg(path.to_string_lossy().to_string());
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            error!("failed to start cloudflared: {}", err);
+            return;
+        }
+    };
+
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+
+    let out_handle = thread::spawn(move || {
+        if let Some(stdout) = out {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                log_cloudflared_line(&line);
+                if let Some(url) = extract_trycloudflare_url(&line) {
+                    info!(target: "cloudflared", "client URL: {}/client", url);
+                }
+            }
+        }
+    });
+
+    let err_handle = thread::spawn(move || {
+        if let Some(stderr) = err {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                log_cloudflared_line(&line);
+                if let Some(url) = extract_trycloudflare_url(&line) {
+                    info!(target: "cloudflared", "client URL: {}/client", url);
+                }
+            }
+        }
+    });
+
+    let _ = child.wait();
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+}
+
+fn find_existing_origin_cert() -> Option<PathBuf> {
+    candidate_origin_cert_paths()
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+fn candidate_origin_cert_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+        let base = PathBuf::from(home);
+        out.push(base.join(".cloudflared").join("cert.pem"));
+        out.push(base.join(".cloudflare-warp").join("cert.pem"));
+        out.push(base.join("cloudflare-warp").join("cert.pem"));
+    }
+    out
+}
+
+fn resolve_tunnel_enabled(mode: RunMode, preference: TunnelPreference) -> bool {
+    if matches!(mode, RunMode::Overlay) {
+        return false;
+    }
+    match preference {
+        TunnelPreference::Always => true,
+        TunnelPreference::Never => false,
+        TunnelPreference::Ask => prompt_enable_tunnel(),
+    }
+}
+
+fn prompt_enable_tunnel() -> bool {
+    loop {
+        print!("是否启动内网穿透 Tunnel? [Y/n]: ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return true;
+        }
+        let s = input.trim().to_ascii_lowercase();
+        if s.is_empty() || s == "y" || s == "yes" {
+            return true;
+        }
+        if s == "n" || s == "no" {
+            return false;
+        }
+        println!("请输入 y 或 n。");
+    }
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn extract_trycloudflare_url(line: &str) -> Option<String> {
+    let start = line.find("https://")?;
+    let tail = &line[start..];
+    let end = tail
+        .find(char::is_whitespace)
+        .unwrap_or(tail.len());
+    let url = &tail[..end];
+    if url.contains("trycloudflare.com") {
+        Some(url.trim_end_matches('/').to_string())
+    } else {
+        None
+    }
+}
+
+fn choose_edge_ip_version(pref: EdgeIpPreference) -> Result<&'static str, String> {
+    match pref {
+        EdgeIpPreference::V4 => return Ok("4"),
+        EdgeIpPreference::V6 => return Ok("6"),
+        EdgeIpPreference::Auto => {}
+    }
+
+    let hosts = ["region1.v2.argotunnel.com", "region2.v2.argotunnel.com"];
+    let mut resolved_any = false;
+    let mut reachable_v4 = false;
+    let mut reachable_v6 = false;
+
+    for host in hosts {
+        let addrs = resolve_host_port(host, 7844)?;
+        if addrs.is_empty() {
+            continue;
+        }
+        resolved_any = true;
+
+        for addr in addrs {
+            if TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok() {
+                info!("tunnel precheck ok: {}", addr);
+                if addr.is_ipv4() {
+                    reachable_v4 = true;
+                } else if addr.is_ipv6() {
+                    reachable_v6 = true;
+                }
+            }
+        }
+    }
+
+    if !resolved_any {
+        return Err("cannot resolve argotunnel DNS records".to_string());
+    }
+    if reachable_v4 {
+        return Ok("4");
+    }
+    if reachable_v6 {
+        return Ok("6");
+    }
+    if !reachable_v4 && !reachable_v6 {
+        return Err("cannot connect to argotunnel on TCP/7844".to_string());
+    }
+    Ok("4")
+}
+
+fn resolve_host_port(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let target = format!("{}:{}", host, port);
+    target
+        .to_socket_addrs()
+        .map(|iter| iter.collect())
+        .map_err(|e| format!("DNS resolve failed for {}: {}", host, e))
+}
+
+fn log_cloudflared_line(line: &str) {
+    let (kind, msg) = split_cloudflared_line(line);
+    if msg.contains("Registered tunnel connection") {
+        TUNNEL_CONNECTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if line.contains("Cannot determine default origin certificate path") {
+        info!(target: "cloudflared", "quick tunnel without login (no cert.pem)");
+    // Some networks intermittently fail this resolver init while tunnel can remain usable.
+    } else
+    // Some networks intermittently fail this resolver init while tunnel can remain usable.
+    if line.contains("Failed to initialize DNS local resolver") {
+        if TUNNEL_CONNECTED.load(std::sync::atomic::Ordering::Relaxed) {
+            info!(target: "cloudflared", "{} (ignored after tunnel connected)", msg);
+        } else {
+            warn!(target: "cloudflared", "{} (transient DNS issue; tunnel may still be connected)", msg);
+            if !DNS_HINT_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!("DNS 修复建议:");
+                warn!("1) 优先使用 --edge-ip-version 4");
+                warn!("2) 验证 DNS: Resolve-DnsName region1.v2.argotunnel.com");
+                warn!("3) 验证 7844: Test-NetConnection region1.v2.argotunnel.com -Port 7844");
+                warn!("4) 若 DNS 不可达，改为可达 DNS（如 8.8.8.8）并 ipconfig /flushdns");
+            }
+        }
+    } else if kind == "ERR" {
+        error!(target: "cloudflared", "{}", msg);
+    } else if kind == "WRN" {
+        warn!(target: "cloudflared", "{}", msg);
+    } else {
+        info!(target: "cloudflared", "{}", msg);
+    }
+}
+
+fn split_cloudflared_line(line: &str) -> (&'static str, &str) {
+    if let Some(i) = line.find(" INF ") {
+        return ("INF", line[i + 5..].trim());
+    }
+    if let Some(i) = line.find(" ERR ") {
+        return ("ERR", line[i + 5..].trim());
+    }
+    if let Some(i) = line.find(" WRN ") {
+        return ("WRN", line[i + 5..].trim());
+    }
+    if let Some(rest) = line.strip_prefix("INF ") {
+        return ("INF", rest.trim());
+    }
+    if let Some(rest) = line.strip_prefix("ERR ") {
+        return ("ERR", rest.trim());
+    }
+    if let Some(rest) = line.strip_prefix("WRN ") {
+        return ("WRN", rest.trim());
+    }
+    ("INF", line.trim())
 }
 
 async fn run_server(port: u16) -> Result<(), String> {
@@ -660,6 +988,19 @@ fn candidate_cjk_font_paths() -> &'static [&'static str] {
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
     ]
 }
+
+#[cfg(target_os = "windows")]
+fn enable_utf8_console() {
+    use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+    unsafe {
+        SetConsoleOutputCP(65001);
+        SetConsoleCP(65001);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enable_utf8_console() {}
+
 async fn index() -> Html<&'static str> {
     Html(
         r#"
@@ -799,6 +1140,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     info!("websocket disconnected");
 }
+
+
+
+
+
+
+
 
 
 
