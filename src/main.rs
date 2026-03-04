@@ -1,4 +1,6 @@
 ﻿use std::{
+    fs,
+    io::{self, Write},
     net::SocketAddr,
     sync::{mpsc, Arc},
     thread,
@@ -17,6 +19,7 @@ use axum::{
 };
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Vec2};
 use futures_util::StreamExt;
+use display_info::DisplayInfo;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_tungstenite::connect_async;
@@ -55,6 +58,26 @@ enum RunMode {
     All,
 }
 
+#[derive(Clone, Copy)]
+struct AppConfig {
+    mode: RunMode,
+    port: u16,
+    monitor_index: Option<i32>,
+    list_monitors: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MonitorSpec {
+    index: usize,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f32,
+    is_primary: bool,
+    name: String,
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -62,36 +85,101 @@ fn main() {
         )
         .init();
 
-    let mode = parse_mode();
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(3000);
+    let mut config = parse_args();
 
-    match mode {
-        RunMode::Server => run_server_blocking(port),
-        RunMode::Overlay => run_overlay_blocking(port),
+    let env_port = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok());
+    if let Some(p) = env_port {
+        config.port = p;
+    }
+
+    let monitors = get_monitors();
+    let mut selected_monitor_index = config.monitor_index;
+    if matches!(config.mode, RunMode::Overlay | RunMode::All) {
+        if monitors.is_empty() {
+            error!("no monitor found; overlay may fail to start");
+        } else {
+            log_monitors(&monitors);
+            selected_monitor_index = prompt_monitor_index(&monitors);
+        }
+    } else if config.list_monitors {
+        log_monitors(&monitors);
+    }
+
+    let overlay_enabled = selected_monitor_index != Some(-1);
+
+    match config.mode {
+        RunMode::Server => run_server_blocking(config.port),
+        RunMode::Overlay => {
+            if overlay_enabled {
+                run_overlay_blocking(config.port, selected_monitor_index, &monitors)
+            } else {
+                info!("overlay disabled by monitor index -1");
+            }
+        }
         RunMode::All => {
+            let port = config.port;
+            let monitor_index = selected_monitor_index;
+            let monitors_for_overlay = monitors.clone();
             let server_thread = thread::spawn(move || run_server_blocking(port));
             // Give the server a short head start before websocket connect attempts.
             thread::sleep(Duration::from_millis(500));
-            run_overlay_blocking(port);
+            if overlay_enabled {
+                run_overlay_blocking(port, monitor_index, &monitors_for_overlay);
+            } else {
+                info!("overlay disabled by monitor index -1");
+                let _ = server_thread.join();
+                return;
+            }
             let _ = server_thread.join();
         }
     }
 }
 
-fn parse_mode() -> RunMode {
+fn parse_args() -> AppConfig {
     let mut mode = RunMode::All;
-    for arg in std::env::args().skip(1) {
+    let mut monitor_index = None;
+    let mut list_monitors = false;
+    let mut port = 3000u16;
+    let mut args = std::env::args().skip(1).peekable();
+
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--server" => mode = RunMode::Server,
             "--overlay" => mode = RunMode::Overlay,
             "--all" => mode = RunMode::All,
+            "--monitor" => {
+                if let Some(v) = args.next() {
+                    match v.parse::<i32>() {
+                        Ok(idx) => monitor_index = Some(idx),
+                        Err(_) => error!("invalid --monitor value: {}", v),
+                    }
+                } else {
+                    error!("missing value for --monitor");
+                }
+            }
+            "--list-monitors" => list_monitors = true,
+            "--port" => {
+                if let Some(v) = args.next() {
+                    match v.parse::<u16>() {
+                        Ok(p) => port = p,
+                        Err(_) => error!("invalid --port value: {}", v),
+                    }
+                } else {
+                    error!("missing value for --port");
+                }
+            }
             _ => {}
         }
     }
-    mode
+
+    AppConfig {
+        mode,
+        port,
+        monitor_index,
+        list_monitors,
+    }
 }
 
 fn run_server_blocking(port: u16) {
@@ -133,31 +221,54 @@ async fn run_server(port: u16) -> Result<(), String> {
         .map_err(|err| format!("failed to serve app: {}", err))
 }
 
-fn run_overlay_blocking(port: u16) {
+fn run_overlay_blocking(port: u16, monitor_index: Option<i32>, monitors: &[MonitorSpec]) {
     let ws_url = format!("ws://127.0.0.1:{}/ws", port);
     info!("starting overlay, ws={}", ws_url);
 
     let (tx, rx) = mpsc::channel::<DanmakuMessage>();
     thread::spawn(move || websocket_consumer_loop(ws_url, tx));
 
+    let selected_monitor = select_monitor(monitors, monitor_index);
+    if let Some(m) = selected_monitor.as_ref() {
+        info!(
+            "overlay monitor={} name='{}' pos=({}, {}) size={}x{} scale={}",
+            m.index, m.name, m.x, m.y, m.width, m.height, m.scale_factor
+        );
+    } else {
+        info!("overlay monitor not resolved, fallback to maximized window");
+    }
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Liver Danmaku Overlay")
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_fullscreen(false)
+        .with_maximized(true)
+        .with_resizable(false)
+        .with_mouse_passthrough(false);
+
+    if let Some(m) = selected_monitor {
+        // Keep the previously stable "maximized transparent window" behavior.
+        // We only steer which monitor it belongs to by setting initial position.
+        viewport = viewport
+            .with_position(Pos2::new(m.x as f32, m.y as f32))
+            .with_inner_size(Vec2::new(320.0, 200.0));
+    }
+
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Liver Danmaku Overlay")
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_fullscreen(false)
-            .with_maximized(true)
-            .with_resizable(false)
-            .with_mouse_passthrough(false),
+        viewport,
         ..Default::default()
     };
 
     let result = eframe::run_native(
         "Liver Danmaku Overlay",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(OverlayApp::new(rx)))),
+        Box::new(move |cc| {
+            configure_overlay_fonts(&cc.egui_ctx);
+            Ok(Box::new(OverlayApp::new(rx)))
+        }),
     );
 
     if let Err(err) = result {
@@ -227,6 +338,103 @@ struct OverlayApp {
     last_frame: Instant,
 }
 
+fn get_monitors() -> Vec<MonitorSpec> {
+    let all = match DisplayInfo::all() {
+        Ok(v) => v,
+        Err(err) => {
+            error!("failed to query monitors: {}", err);
+            return Vec::new();
+        }
+    };
+
+    all.into_iter()
+        .enumerate()
+        .map(|(idx, m)| MonitorSpec {
+            index: idx,
+            x: m.x,
+            y: m.y,
+            width: m.width,
+            height: m.height,
+            scale_factor: m.scale_factor,
+            is_primary: m.is_primary,
+            name: m.name,
+        })
+        .collect()
+}
+
+fn log_monitors(monitors: &[MonitorSpec]) {
+    if monitors.is_empty() {
+        info!("no monitors found");
+        return;
+    }
+    info!("detected {} monitor(s):", monitors.len());
+    for m in monitors {
+        info!(
+            "  [{}] {}{} pos=({}, {}) size={}x{} scale={}",
+            m.index,
+            m.name,
+            if m.is_primary { " (primary)" } else { "" },
+            m.x,
+            m.y,
+            m.width,
+            m.height,
+            m.scale_factor
+        );
+    }
+}
+
+fn prompt_monitor_index(monitors: &[MonitorSpec]) -> Option<i32> {
+    let default_idx = monitors
+        .iter()
+        .find(|m| m.is_primary)
+        .map(|m| m.index)
+        .unwrap_or(0) as i32;
+
+    loop {
+        print!("请选择弹幕显示器编号（回车默认 {}，输入 -1 为不显示悬浮层）: ", default_idx);
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            error!("failed to read monitor input, fallback to default {}", default_idx);
+            return Some(default_idx);
+        }
+
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Some(default_idx);
+        }
+
+        match trimmed.parse::<i32>() {
+            Ok(-1) => return Some(-1),
+            Ok(idx) if monitors.iter().any(|m| m.index == idx as usize) => return Some(idx),
+            _ => println!("无效编号：{}，请重新输入。", trimmed),
+        }
+    }
+}
+
+fn select_monitor(monitors: &[MonitorSpec], monitor_index: Option<i32>) -> Option<MonitorSpec> {
+    if monitors.is_empty() {
+        return None;
+    }
+
+    if let Some(idx) = monitor_index {
+        if idx < 0 {
+            return None;
+        }
+        if let Some(found) = monitors.iter().find(|m| m.index == idx as usize) {
+            return Some(found.clone());
+        }
+        error!("monitor index {} not found, fallback to primary", idx);
+    }
+
+    if let Some(primary) = monitors.iter().find(|m| m.is_primary) {
+        return Some(primary.clone());
+    }
+
+    Some(monitors[0].clone())
+}
+
 impl OverlayApp {
     fn new(rx: mpsc::Receiver<DanmakuMessage>) -> Self {
         Self {
@@ -287,8 +495,10 @@ impl OverlayApp {
         });
     }
 
-    fn apply_click_through(&self, ctx: &egui::Context) {
+    fn apply_overlay_window_flags(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
     }
 }
 
@@ -305,7 +515,7 @@ impl eframe::App for OverlayApp {
 
         let viewport = ctx.screen_rect().size();
 
-        self.apply_click_through(ctx);
+        self.apply_overlay_window_flags(ctx);
 
         while let Ok(msg) = self.rx.try_recv() {
             self.spawn_danmaku(ctx, msg, viewport, now_s);
@@ -343,7 +553,7 @@ impl eframe::App for OverlayApp {
                 painter.text(
                     Pos2::new(14.0, 10.0),
                     Align2::LEFT_TOP,
-                    "Liver Overlay Running  |  鼠标穿透: 开",
+                    "Liver Overlay Running",
                     FontId::proportional(16.0),
                     Color32::from_rgba_unmultiplied(200, 255, 200, 220),
                 );
@@ -382,6 +592,74 @@ fn parse_color_or_white(input: &str) -> Color32 {
     }
 }
 
+
+fn configure_overlay_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut loaded = Vec::new();
+
+    for (idx, path) in candidate_cjk_font_paths().iter().enumerate() {
+        if let Ok(bytes) = fs::read(path) {
+            let key = format!("cjk_{}", idx);
+            fonts
+                .font_data
+                .insert(key.clone(), egui::FontData::from_owned(bytes).into());
+            loaded.push((key, *path));
+        }
+    }
+
+    if loaded.is_empty() {
+        error!("no CJK font found for overlay; Chinese may render as squares");
+        return;
+    }
+
+    for (key, _) in loaded.iter().rev() {
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, key.clone());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, key.clone());
+    }
+
+    ctx.set_fonts(fonts);
+    let names: Vec<&str> = loaded.iter().map(|(_, path)| *path).collect();
+    info!("overlay loaded CJK font(s): {}", names.join(", "));
+}
+
+#[cfg(target_os = "windows")]
+fn candidate_cjk_font_paths() -> &'static [&'static str] {
+    &[
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+        "C:/Windows/Fonts/simkai.ttf",
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn candidate_cjk_font_paths() -> &'static [&'static str] {
+    &[
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn candidate_cjk_font_paths() -> &'static [&'static str] {
+    &[
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ]
+}
 async fn index() -> Html<&'static str> {
     Html(
         r#"
@@ -521,3 +799,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     info!("websocket disconnected");
 }
+
+
+
+
+
+

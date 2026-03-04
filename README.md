@@ -8,6 +8,8 @@
 
 先确保当前终端可用 `cargo`。如果刚安装 Rust，请重开一个终端。
 
+支持 `Windows / macOS / Linux`。
+
 1. 默认同时启动服务端 + 悬浮层：
 
 ```bash
@@ -25,6 +27,18 @@ cargo run -- --server
 ```bash
 cargo run -- --overlay
 ```
+
+4. 启动包含悬浮层的模式时，会自动在命令行打印显示器列表并等待你输入编号。
+
+例如：
+
+```bash
+[0] Color LCD (primary)
+[1] EPSON Projector
+请选择弹幕显示器编号（回车默认 0，输入 -1 为不显示悬浮层）:
+```
+
+如果只运行服务端（`--server`），不会进入显示器选择交互。
 
 ## 页面与接口
 
