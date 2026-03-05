@@ -978,7 +978,8 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
 
 #[cfg(target_os = "macos")]
 fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
-    use objc::msg_send;
+    use objc::{msg_send, sel, sel_impl};
+    use objc::runtime::Object;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     let Ok(handle) = cc.window_handle() else {
@@ -989,8 +990,8 @@ fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
     let ns_window = match handle.as_raw() {
         RawWindowHandle::AppKit(appkit) => {
             // raw-window-handle 0.6 exposes `ns_view`; fetch NSWindow from it.
-            let ns_view = appkit.ns_view.as_ptr();
-            let window: *mut std::ffi::c_void = unsafe { msg_send![ns_view, window] };
+            let ns_view = appkit.ns_view.as_ptr() as *mut Object;
+            let window: *mut Object = unsafe { msg_send![ns_view, window] };
             window
         }
         _ => {
