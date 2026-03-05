@@ -612,6 +612,7 @@ fn run_overlay_blocking(port: u16, monitor_index: Option<i32>, monitors: &[Monit
         native_options,
         Box::new(move |cc| {
             configure_overlay_fonts(&cc.egui_ctx);
+            configure_macos_overlay_window(cc);
             Ok(Box::new(OverlayApp::new(rx)))
         }),
     );
@@ -974,6 +975,44 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
     let names: Vec<&str> = loaded.iter().map(|(_, path)| *path).collect();
     info!("overlay loaded CJK font(s): {}", names.join(", "));
 }
+
+#[cfg(target_os = "macos")]
+fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = cc.window_handle() else {
+        warn!("failed to fetch macOS window handle");
+        return;
+    };
+
+    let ns_window = match handle.as_raw() {
+        RawWindowHandle::AppKit(appkit) => appkit.ns_window.as_ptr(),
+        _ => {
+            warn!("unexpected raw window handle on macOS");
+            return;
+        }
+    };
+
+    // NSWindowCollectionBehavior flags:
+    // 1 << 0  -> CanJoinAllSpaces
+    // 1 << 4  -> Stationary
+    // 1 << 8  -> FullScreenAuxiliary
+    const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const STATIONARY: usize = 1 << 4;
+    const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+
+    unsafe {
+        let current: usize = msg_send![ns_window, collectionBehavior];
+        let updated = current | CAN_JOIN_ALL_SPACES | STATIONARY | FULL_SCREEN_AUXILIARY;
+        let _: () = msg_send![ns_window, setCollectionBehavior: updated];
+    }
+
+    info!("configured macOS overlay window for fullscreen spaces");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_macos_overlay_window(_cc: &eframe::CreationContext<'_>) {}
 
 #[cfg(target_os = "windows")]
 fn candidate_cjk_font_paths() -> &'static [&'static str] {

@@ -16,6 +16,10 @@ egui = "0.31"
 futures-util = "0.3"
 tokio-tungstenite = "0.24"
 display-info = "0.5"
+raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"

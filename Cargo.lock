@@ -1940,6 +1940,8 @@ dependencies = [
  "eframe",
  "egui",
  "futures-util",
+ "objc",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tokio",
