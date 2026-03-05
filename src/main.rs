@@ -682,6 +682,8 @@ struct OverlayApp {
     lane_busy_until: Vec<f64>,
     started_at: Instant,
     last_frame: Instant,
+    top_padding: f32,
+    lane_height: f32,
 }
 
 fn get_monitors() -> Vec<MonitorSpec> {
@@ -781,21 +783,33 @@ fn select_monitor(monitors: &[MonitorSpec], monitor_index: Option<i32>) -> Optio
     Some(monitors[0].clone())
 }
 
+fn overlay_top_padding() -> f32 {
+    // macOS fullscreen presentations (especially Keynote) keep a top reserved area.
+    let default = if cfg!(target_os = "macos") { 56.0 } else { 20.0 };
+    std::env::var("DANMAKU_TOP_PADDING")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v >= 0.0 && *v <= 300.0)
+        .unwrap_or(default)
+}
+
 impl OverlayApp {
     fn new(rx: mpsc::Receiver<DanmakuMessage>) -> Self {
+        let top_padding = overlay_top_padding();
+        info!("overlay top padding={}", top_padding);
         Self {
             rx,
             danmaku: Vec::new(),
             lane_busy_until: Vec::new(),
             started_at: Instant::now(),
             last_frame: Instant::now(),
+            top_padding,
+            lane_height: 50.0,
         }
     }
 
     fn rebuild_lanes(&mut self, height: f32) {
-        let top_padding = 20.0;
-        let lane_height = 50.0;
-        let count = ((height - top_padding * 2.0) / lane_height).max(1.0) as usize;
+        let count = ((height - self.top_padding * 2.0) / self.lane_height).max(1.0) as usize;
 
         if self.lane_busy_until.len() != count {
             self.lane_busy_until = vec![0.0; count];
@@ -823,9 +837,7 @@ impl OverlayApp {
         let width = galley.size().x.max(30.0);
 
         let lane_index = choose_lane(&self.lane_busy_until, now_s);
-        let lane_height = 50.0;
-        let top_padding = 20.0;
-        let y = top_padding + lane_index as f32 * lane_height;
+        let y = self.top_padding + lane_index as f32 * self.lane_height;
 
         let gap_distance = width + 80.0;
         self.lane_busy_until[lane_index] = now_s + (gap_distance / speed) as f64;
@@ -982,6 +994,11 @@ fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
     use objc::runtime::Object;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGShieldingWindowLevel() -> i32;
+    }
+
     let Ok(handle) = cc.window_handle() else {
         warn!("failed to fetch macOS window handle");
         return;
@@ -1016,9 +1033,13 @@ fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
         let current: usize = msg_send![ns_window, collectionBehavior];
         let updated = current | CAN_JOIN_ALL_SPACES | STATIONARY | FULL_SCREEN_AUXILIARY;
         let _: () = msg_send![ns_window, setCollectionBehavior: updated];
+
+        // Raise window above native fullscreen presentation windows (e.g. Keynote fullscreen).
+        let level = CGShieldingWindowLevel() + 1;
+        let _: () = msg_send![ns_window, setLevel: level];
     }
 
-    info!("configured macOS overlay window for fullscreen spaces");
+    info!("configured macOS overlay window for fullscreen spaces and high window level");
 }
 
 #[cfg(not(target_os = "macos"))]
