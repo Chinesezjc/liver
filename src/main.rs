@@ -579,19 +579,19 @@ fn run_overlay_blocking(port: u16, monitor_index: Option<i32>, monitors: &[Monit
     if let Some(m) = selected_monitor {
         if cfg!(target_os = "macos") {
             // On macOS, maximized windows often stick to primary display.
-            // Use exact monitor bounds in logical points to honor user selection.
-            let scale = if m.scale_factor > 0.0 { m.scale_factor } else { 1.0 };
-            let logical_x = m.x as f32 / scale;
-            let logical_y = m.y as f32 / scale;
-            let logical_w = (m.width as f32 / scale).max(200.0);
-            let logical_h = (m.height as f32 / scale).max(120.0);
+            // Use monitor bounds directly to honor user selection.
+            // display-info values here are already suitable for window positioning.
+            let x = m.x as f32;
+            let y = m.y as f32;
+            let w = (m.width as f32).max(200.0);
+            let h = (m.height as f32).max(120.0);
             viewport = viewport
                 .with_maximized(false)
-                .with_position(Pos2::new(logical_x, logical_y))
-                .with_inner_size(Vec2::new(logical_w, logical_h));
+                .with_position(Pos2::new(x, y))
+                .with_inner_size(Vec2::new(w, h));
             info!(
-                "macOS logical monitor bounds: x={}, y={}, w={}, h={}",
-                logical_x, logical_y, logical_w, logical_h
+                "macOS monitor bounds: x={}, y={}, w={}, h={}",
+                x, y, w, h
             );
         } else {
             // Keep the previously stable behavior for non-macOS.
