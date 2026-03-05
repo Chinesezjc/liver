@@ -572,16 +572,33 @@ fn run_overlay_blocking(port: u16, monitor_index: Option<i32>, monitors: &[Monit
         .with_transparent(true)
         .with_always_on_top()
         .with_fullscreen(false)
-        .with_maximized(true)
+        .with_maximized(!cfg!(target_os = "macos"))
         .with_resizable(false)
         .with_mouse_passthrough(false);
 
     if let Some(m) = selected_monitor {
-        // Keep the previously stable "maximized transparent window" behavior.
-        // We only steer which monitor it belongs to by setting initial position.
-        viewport = viewport
-            .with_position(Pos2::new(m.x as f32, m.y as f32))
-            .with_inner_size(Vec2::new(320.0, 200.0));
+        if cfg!(target_os = "macos") {
+            // On macOS, maximized windows often stick to primary display.
+            // Use exact monitor bounds in logical points to honor user selection.
+            let scale = if m.scale_factor > 0.0 { m.scale_factor } else { 1.0 };
+            let logical_x = m.x as f32 / scale;
+            let logical_y = m.y as f32 / scale;
+            let logical_w = (m.width as f32 / scale).max(200.0);
+            let logical_h = (m.height as f32 / scale).max(120.0);
+            viewport = viewport
+                .with_maximized(false)
+                .with_position(Pos2::new(logical_x, logical_y))
+                .with_inner_size(Vec2::new(logical_w, logical_h));
+            info!(
+                "macOS logical monitor bounds: x={}, y={}, w={}, h={}",
+                logical_x, logical_y, logical_w, logical_h
+            );
+        } else {
+            // Keep the previously stable behavior for non-macOS.
+            viewport = viewport
+                .with_position(Pos2::new(m.x as f32, m.y as f32))
+                .with_inner_size(Vec2::new(320.0, 200.0));
+        }
     }
 
     let native_options = eframe::NativeOptions {
