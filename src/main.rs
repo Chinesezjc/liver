@@ -859,6 +859,9 @@ impl OverlayApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
     }
 }
 
@@ -999,6 +1002,7 @@ fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGShieldingWindowLevel() -> i32;
+        fn CGWindowLevelForKey(key: i32) -> i32;
     }
 
     let Ok(handle) = cc.window_handle() else {
@@ -1025,24 +1029,42 @@ fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
 
     // NSWindowCollectionBehavior flags:
     // 1 << 0  -> CanJoinAllSpaces
+    // 1 << 1  -> MoveToActiveSpace
+    // 1 << 3  -> Transient
     // 1 << 4  -> Stationary
     // 1 << 8  -> FullScreenAuxiliary
     const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+    const TRANSIENT: usize = 1 << 3;
     const STATIONARY: usize = 1 << 4;
     const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
 
+    // CoreGraphics CGWindowLevelKey values.
+    const K_CG_FLOATING_WINDOW_LEVEL_KEY: i32 = 5;
+    const K_CG_OVERLAY_WINDOW_LEVEL_KEY: i32 = 15;
+
     unsafe {
         let current: usize = msg_send![ns_window, collectionBehavior];
-        let updated = current | CAN_JOIN_ALL_SPACES | STATIONARY | FULL_SCREEN_AUXILIARY;
+        let updated = current
+            | CAN_JOIN_ALL_SPACES
+            | MOVE_TO_ACTIVE_SPACE
+            | TRANSIENT
+            | STATIONARY
+            | FULL_SCREEN_AUXILIARY;
         let _: () = msg_send![ns_window, setCollectionBehavior: updated];
 
-        // Raise window above native fullscreen presentation windows (e.g. Keynote fullscreen).
-        let level = CGShieldingWindowLevel() + 1;
+        // Tencent-style strategy: floating/overlay level + all-spaces/fullscreen auxiliary.
+        let floating = CGWindowLevelForKey(K_CG_FLOATING_WINDOW_LEVEL_KEY);
+        let overlay = CGWindowLevelForKey(K_CG_OVERLAY_WINDOW_LEVEL_KEY);
+        let shielding = CGShieldingWindowLevel() + 1;
+        let level = floating.max(overlay).max(shielding);
         let _: () = msg_send![ns_window, setLevel: level];
+        let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
+        let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
         let _: () = msg_send![ns_window, orderFrontRegardless];
     }
 
-    info!("configured macOS overlay window for fullscreen spaces and high window level");
+    info!("configured macOS overlay window with floating/overlay all-spaces strategy");
 }
 
 #[cfg(not(target_os = "macos"))]
