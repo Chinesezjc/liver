@@ -570,11 +570,13 @@ fn run_overlay_blocking(port: u16, monitor_index: Option<i32>, monitors: &[Monit
         .with_title("Liver Danmaku Overlay")
         .with_decorations(false)
         .with_transparent(true)
-        .with_always_on_top()
         .with_fullscreen(false)
         .with_maximized(!cfg!(target_os = "macos"))
         .with_resizable(false)
         .with_mouse_passthrough(false);
+    if !cfg!(target_os = "macos") {
+        viewport = viewport.with_always_on_top();
+    }
 
     if let Some(m) = selected_monitor {
         if cfg!(target_os = "macos") {
@@ -1037,6 +1039,7 @@ fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
         // Raise window above native fullscreen presentation windows (e.g. Keynote fullscreen).
         let level = CGShieldingWindowLevel() + 1;
         let _: () = msg_send![ns_window, setLevel: level];
+        let _: () = msg_send![ns_window, orderFrontRegardless];
     }
 
     info!("configured macOS overlay window for fullscreen spaces and high window level");
