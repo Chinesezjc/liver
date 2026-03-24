@@ -996,7 +996,7 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
 #[cfg(target_os = "macos")]
 fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
     use objc::{msg_send, sel, sel_impl};
-    use objc::runtime::Object;
+    use objc::runtime::{Object, NO, YES};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -1057,10 +1057,10 @@ fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
         let floating = CGWindowLevelForKey(K_CG_FLOATING_WINDOW_LEVEL_KEY);
         let overlay = CGWindowLevelForKey(K_CG_OVERLAY_WINDOW_LEVEL_KEY);
         let shielding = CGShieldingWindowLevel() + 1;
-        let level = floating.max(overlay).max(shielding);
+        let level = floating.max(overlay).max(shielding) as isize;
         let _: () = msg_send![ns_window, setLevel: level];
-        let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
-        let _: () = msg_send![ns_window, setHidesOnDeactivate: false];
+        let _: () = msg_send![ns_window, setIgnoresMouseEvents: YES];
+        let _: () = msg_send![ns_window, setHidesOnDeactivate: NO];
         let _: () = msg_send![ns_window, orderFrontRegardless];
     }
 
