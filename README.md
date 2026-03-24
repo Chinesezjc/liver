@@ -37,13 +37,19 @@ cargo run -- --overlay
 cargo run -- --follow-monitor
 ```
 
-5. 如果你想显式开启“自动追踪前台窗口”的模式，可以使用：
+5. 如果你想显式开启“有全屏窗口就切到对应屏幕，否则按显示器显示”的混合模式，可以使用：
+
+```bash
+cargo run -- --follow-fullscreen
+```
+
+6. 如果你想显式开启“自动追踪前台窗口”的模式，可以使用：
 
 ```bash
 cargo run -- --follow-window
 ```
 
-6. 启动包含悬浮层的模式时，在“按显示器覆盖”模式下会自动打印显示器列表并等待你输入编号。
+7. 启动包含悬浮层的模式时，在“按显示器覆盖”或“全屏优先”模式下会自动打印显示器列表并等待你输入编号。
 
 例如：
 
@@ -57,9 +63,10 @@ cargo run -- --follow-window
 
 ## macOS 说明
 
-- macOS 默认启用“自动追踪前台窗口”，弹幕层会跟随当前最前面的应用窗口移动和缩放。
+- macOS 默认启用“全屏优先”模式：当前台窗口基本占满某个屏幕时，弹幕层会切到对应屏幕；否则回到你选择的显示器覆盖模式。
 - macOS 的 `--follow-window` 现在默认优先走原生 helper window 路线：独立 `NSWindow + WKWebView` 承载透明弹幕层，目的是更接近腾讯会议这类会议软件在原生全屏上的 overlay 形态。
 - macOS 的窗口跟随优先基于 Quartz / Window Server 的具体窗口实体（`CGWindowID`）同步 bounds，而不是只按前台应用做模糊匹配。
+- `--follow-fullscreen` 只会在检测到前台窗口基本占满某块屏幕时才切过去；普通窗口状态下会保持显示器覆盖，不会一直追着窗口跑。
 - helper window 会跟随活动 Space 变化，并尽量以全屏辅助窗口的方式参与显示；同时会尽量加入其他应用的 Space / 全屏集合。如果你想切回相对保守的 helper panel 路线，可以执行：`DANMAKU_MACOS_HELPER_WINDOW_KIND=panel cargo run -- --follow-window`
 - macOS 悬浮层默认会尝试使用更高的 assistive-tech 级别窗口层级；如果想临时回退做对比，可以用 `DANMAKU_MACOS_WINDOW_LEVEL=1000 cargo run -- --follow-window` 或 `DANMAKU_MACOS_WINDOW_LEVEL=26 cargo run -- --follow-window`
 - 如果你想临时回退到旧的 `eframe` 路线，可以执行：`DANMAKU_MACOS_OVERLAY_BACKEND=eframe cargo run -- --follow-window`

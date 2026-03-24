@@ -116,6 +116,7 @@ enum RunMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OverlayAttachMode {
     Monitor,
+    FullscreenWindow,
     FrontmostWindow,
 }
 
@@ -251,7 +252,7 @@ fn main() {
 
 fn default_overlay_attach_mode() -> OverlayAttachMode {
     if cfg!(target_os = "macos") {
-        OverlayAttachMode::FrontmostWindow
+        OverlayAttachMode::FullscreenWindow
     } else {
         OverlayAttachMode::Monitor
     }
@@ -278,6 +279,7 @@ fn parse_args() -> AppConfig {
             "--all" => mode = RunMode::All,
             "--tunnel" => tunnel_preference = TunnelPreference::Always,
             "--no-tunnel" => tunnel_preference = TunnelPreference::Never,
+            "--follow-fullscreen" => overlay_attach_mode = OverlayAttachMode::FullscreenWindow,
             "--follow-window" => overlay_attach_mode = OverlayAttachMode::FrontmostWindow,
             "--follow-monitor" => overlay_attach_mode = OverlayAttachMode::Monitor,
             "--edge-ip-version" => {
@@ -663,10 +665,15 @@ fn run_overlay_blocking(
     }
 
     #[cfg(target_os = "macos")]
-    if matches!(attach_mode, OverlayAttachMode::FrontmostWindow)
+    if overlay_attach_mode_uses_window_tracking(attach_mode)
         && macos_native_helper_overlay_enabled()
     {
-        match run_macos_native_helper_overlay_blocking(port, monitors, selected_monitor.as_ref()) {
+        match run_macos_native_helper_overlay_blocking(
+            port,
+            monitors,
+            selected_monitor.as_ref(),
+            attach_mode,
+        ) {
             Ok(()) => return,
             Err(err) => {
                 warn!("native helper overlay failed, fallback to eframe: {}", err);
@@ -687,7 +694,7 @@ fn run_overlay_blocking(
         .with_mouse_passthrough(true)
         .with_window_level(egui::WindowLevel::AlwaysOnTop);
 
-    if let Some(m) = selected_monitor {
+    if let Some(m) = selected_monitor.as_ref() {
         if cfg!(target_os = "macos") {
             // On macOS, maximized windows often stick to primary display.
             // Use monitor bounds directly to honor user selection.
@@ -734,7 +741,12 @@ fn run_overlay_blocking(
             }
             #[cfg(not(target_os = "macos"))]
             configure_macos_overlay_window(cc);
-            Ok(Box::new(OverlayApp::new(rx, attach_mode)))
+            Ok(Box::new(OverlayApp::new(
+                rx,
+                attach_mode,
+                selected_monitor.clone(),
+                monitors.to_vec(),
+            )))
         }),
     );
 
@@ -863,7 +875,9 @@ unsafe impl Encode for NSRect {
 #[cfg(target_os = "macos")]
 struct MacNativeOverlayState {
     panel: *mut Object,
+    attach_mode: OverlayAttachMode,
     window_kind: MacHelperWindowKind,
+    monitors: Vec<MonitorSpec>,
     tracker: MacWindowTracker,
     tracked_window: Option<MacTrackedWindow>,
     fallback_bounds: MacWindowBounds,
@@ -935,6 +949,7 @@ fn run_macos_native_helper_overlay_blocking(
     port: u16,
     monitors: &[MonitorSpec],
     selected_monitor: Option<&MonitorSpec>,
+    attach_mode: OverlayAttachMode,
 ) -> Result<(), String> {
     let app: *mut Object = unsafe { msg_send![class!(NSApplication), sharedApplication] };
     if app.is_null() {
@@ -947,7 +962,7 @@ fn run_macos_native_helper_overlay_blocking(
     let window_kind = macos_helper_window_kind();
     let helper_level = macos_overlay_window_level();
     let helper_behavior = macos_helper_collection_behavior(window_kind);
-    let tracked_window = tracker.poll_target();
+    let tracked_window = macos_poll_overlay_target(&mut tracker, attach_mode, monitors);
     let fallback_bounds = macos_native_helper_fallback_bounds(selected_monitor);
     let desktop_bottom = macos_desktop_bottom_edge(monitors);
     let initial_bounds = tracked_window
@@ -981,7 +996,9 @@ fn run_macos_native_helper_overlay_blocking(
 
     let mut state = Box::new(MacNativeOverlayState {
         panel,
+        attach_mode,
         window_kind,
+        monitors: monitors.to_vec(),
         tracker,
         tracked_window,
         fallback_bounds,
@@ -1055,6 +1072,84 @@ fn macos_desktop_bottom_edge(monitors: &[MonitorSpec]) -> f32 {
         .iter()
         .map(|monitor| monitor.y as f32 + monitor.height as f32)
         .fold(0.0, f32::max)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_monitor_bounds(monitor: &MonitorSpec) -> MacWindowBounds {
+    MacWindowBounds {
+        x: monitor.x as f32,
+        y: monitor.y as f32,
+        width: monitor.width as f32,
+        height: monitor.height as f32,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_rect_intersection_area(a: MacWindowBounds, b: MacWindowBounds) -> f32 {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    let width = (right - left).max(0.0);
+    let height = (bottom - top).max(0.0);
+    width * height
+}
+
+#[cfg(target_os = "macos")]
+fn macos_snap_fullscreen_target_to_monitor(
+    mut target: MacTrackedWindow,
+    monitors: &[MonitorSpec],
+) -> Option<MacTrackedWindow> {
+    let window_area = (target.bounds.width * target.bounds.height).max(1.0);
+    let mut best_monitor: Option<&MonitorSpec> = None;
+    let mut best_overlap = 0.0f32;
+
+    for monitor in monitors {
+        let monitor_bounds = macos_monitor_bounds(monitor);
+        let overlap = macos_rect_intersection_area(target.bounds, monitor_bounds);
+        if overlap > best_overlap {
+            best_overlap = overlap;
+            best_monitor = Some(monitor);
+        }
+    }
+
+    let monitor = best_monitor?;
+    let monitor_bounds = macos_monitor_bounds(monitor);
+    let monitor_area = (monitor_bounds.width * monitor_bounds.height).max(1.0);
+    let monitor_coverage = best_overlap / monitor_area;
+    let window_coverage = best_overlap / window_area;
+    let width_ratio = target.bounds.width / monitor_bounds.width.max(1.0);
+    let height_ratio = target.bounds.height / monitor_bounds.height.max(1.0);
+    let left_delta = (target.bounds.x - monitor_bounds.x).abs();
+    let top_delta = (target.bounds.y - monitor_bounds.y).abs();
+
+    if monitor_coverage < 0.88
+        || window_coverage < 0.75
+        || width_ratio < 0.88
+        || height_ratio < 0.84
+        || left_delta > 96.0
+        || top_delta > 96.0
+    {
+        return None;
+    }
+
+    target.bounds = monitor_bounds;
+    Some(target)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_poll_overlay_target(
+    tracker: &mut MacWindowTracker,
+    attach_mode: OverlayAttachMode,
+    monitors: &[MonitorSpec],
+) -> Option<MacTrackedWindow> {
+    match attach_mode {
+        OverlayAttachMode::Monitor => None,
+        OverlayAttachMode::FrontmostWindow => tracker.poll_target(),
+        OverlayAttachMode::FullscreenWindow => tracker
+            .poll_frontmost_candidate()
+            .and_then(|target| macos_snap_fullscreen_target_to_monitor(target, monitors)),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1214,7 +1309,8 @@ fn macos_apply_native_helper_panel_bounds(panel: *mut Object, bounds: MacWindowB
 fn macos_sync_native_helper_state(state: &mut MacNativeOverlayState) {
     macos_apply_native_helper_panel_style(state.panel, state.window_kind);
 
-    let next_target = state.tracker.poll_target();
+    let next_target =
+        macos_poll_overlay_target(&mut state.tracker, state.attach_mode, &state.monitors);
     if let Some(target) = next_target {
         let appkit_bounds = macos_top_left_to_appkit_bounds(target.bounds, state.desktop_bottom);
         let previous = state.tracked_window.clone();
@@ -1250,6 +1346,31 @@ fn macos_sync_native_helper_state(state: &mut MacNativeOverlayState) {
             macos_apply_native_helper_panel_bounds(state.panel, appkit_bounds);
         }
         state.tracked_window = Some(target);
+        return;
+    }
+
+    if matches!(state.attach_mode, OverlayAttachMode::FullscreenWindow) {
+        if state.tracked_window.is_some() {
+            info!(
+                "native helper no fullscreen window detected, fallback to monitor pos=({}, {}) size={}x{}",
+                state.fallback_bounds.x.round() as i32,
+                state.fallback_bounds.y.round() as i32,
+                state.fallback_bounds.width.round() as i32,
+                state.fallback_bounds.height.round() as i32
+            );
+        }
+
+        let fallback_bounds =
+            macos_top_left_to_appkit_bounds(state.fallback_bounds, state.desktop_bottom);
+        if state
+            .tracked_window
+            .as_ref()
+            .map(|prev| !same_mac_window_bounds(prev.bounds, state.fallback_bounds))
+            .unwrap_or(true)
+        {
+            macos_apply_native_helper_panel_bounds(state.panel, fallback_bounds);
+        }
+        state.tracked_window = None;
         return;
     }
 
@@ -1407,23 +1528,25 @@ impl MacWindowTracker {
         }
     }
 
-    fn poll_target(&mut self) -> Option<MacTrackedWindow> {
+    fn poll_frontmost_candidate(&mut self) -> Option<MacTrackedWindow> {
         let frontmost_pid = macos_frontmost_application_pid().filter(|pid| *pid != self.own_pid);
         let accessibility_target = macos_pick_accessibility_focused_window()
             .filter(|window| window.owner_pid != self.own_pid);
 
-        let target = accessibility_target.or_else(|| {
-            frontmost_pid
-                .and_then(macos_pick_best_window_for_pid)
-                .or_else(|| self.last_window_id.and_then(macos_find_window_by_id))
-                .or_else(|| macos_pick_first_external_window(self.own_pid))
-        });
+        let target =
+            accessibility_target.or_else(|| frontmost_pid.and_then(macos_pick_best_window_for_pid));
 
         if let Some(target) = target.as_ref() {
             self.last_window_id = Some(target.window_id);
         }
 
         target
+    }
+
+    fn poll_target(&mut self) -> Option<MacTrackedWindow> {
+        self.poll_frontmost_candidate()
+            .or_else(|| self.last_window_id.and_then(macos_find_window_by_id))
+            .or_else(|| macos_pick_first_external_window(self.own_pid))
     }
 }
 
@@ -1436,6 +1559,10 @@ struct OverlayApp {
     last_frame: Instant,
     top_padding: f32,
     lane_height: f32,
+    #[cfg(target_os = "macos")]
+    fallback_bounds: Option<MacWindowBounds>,
+    #[cfg(target_os = "macos")]
+    monitors: Vec<MonitorSpec>,
     #[cfg(target_os = "macos")]
     window_tracker: Option<MacWindowTracker>,
     #[cfg(target_os = "macos")]
@@ -1550,14 +1677,26 @@ fn select_monitor(monitors: &[MonitorSpec], monitor_index: Option<i32>) -> Optio
 fn overlay_attach_mode_label(mode: OverlayAttachMode) -> &'static str {
     match mode {
         OverlayAttachMode::Monitor => "monitor",
+        OverlayAttachMode::FullscreenWindow => "fullscreen-window",
         OverlayAttachMode::FrontmostWindow => "frontmost-window",
     }
 }
 
+fn overlay_attach_mode_uses_window_tracking(mode: OverlayAttachMode) -> bool {
+    cfg!(target_os = "macos")
+        && matches!(
+            mode,
+            OverlayAttachMode::FullscreenWindow | OverlayAttachMode::FrontmostWindow
+        )
+}
+
 fn overlay_top_padding(attach_mode: OverlayAttachMode) -> f32 {
     // macOS fullscreen presentations (especially Keynote) keep a top reserved area.
-    let default = if cfg!(target_os = "macos") && matches!(attach_mode, OverlayAttachMode::Monitor)
-    {
+    let default = if cfg!(target_os = "macos")
+        && matches!(
+            attach_mode,
+            OverlayAttachMode::Monitor | OverlayAttachMode::FullscreenWindow
+        ) {
         56.0
     } else {
         20.0
@@ -1587,7 +1726,12 @@ fn macos_log_ns_window_hacks_hint_once() {
 }
 
 impl OverlayApp {
-    fn new(rx: mpsc::Receiver<DanmakuMessage>, attach_mode: OverlayAttachMode) -> Self {
+    fn new(
+        rx: mpsc::Receiver<DanmakuMessage>,
+        attach_mode: OverlayAttachMode,
+        selected_monitor: Option<MonitorSpec>,
+        monitors: Vec<MonitorSpec>,
+    ) -> Self {
         let top_padding = overlay_top_padding(attach_mode);
         info!(
             "overlay top padding={}, attach_mode={}",
@@ -1604,7 +1748,11 @@ impl OverlayApp {
             top_padding,
             lane_height: 50.0,
             #[cfg(target_os = "macos")]
-            window_tracker: matches!(attach_mode, OverlayAttachMode::FrontmostWindow)
+            fallback_bounds: selected_monitor.as_ref().map(macos_monitor_bounds),
+            #[cfg(target_os = "macos")]
+            monitors,
+            #[cfg(target_os = "macos")]
+            window_tracker: overlay_attach_mode_uses_window_tracking(attach_mode)
                 .then(MacWindowTracker::new),
             #[cfg(target_os = "macos")]
             tracked_window: None,
@@ -1674,7 +1822,7 @@ impl OverlayApp {
 
     #[cfg(target_os = "macos")]
     fn sync_tracked_window(&mut self, ctx: &egui::Context) {
-        if !matches!(self.attach_mode, OverlayAttachMode::FrontmostWindow) {
+        if !overlay_attach_mode_uses_window_tracking(self.attach_mode) {
             return;
         }
 
@@ -1689,7 +1837,35 @@ impl OverlayApp {
         let Some(tracker) = self.window_tracker.as_mut() else {
             return;
         };
-        let Some(target) = tracker.poll_target() else {
+
+        let next_target = macos_poll_overlay_target(tracker, self.attach_mode, &self.monitors);
+        let Some(target) = next_target else {
+            if matches!(self.attach_mode, OverlayAttachMode::FullscreenWindow) {
+                if let Some(bounds) = self.fallback_bounds {
+                    if self
+                        .tracked_window
+                        .as_ref()
+                        .map(|prev| !same_mac_window_bounds(prev.bounds, bounds))
+                        .unwrap_or(true)
+                    {
+                        info!(
+                            "no fullscreen window detected, fallback to monitor pos=({}, {}) size={}x{}",
+                            bounds.x.round() as i32,
+                            bounds.y.round() as i32,
+                            bounds.width.round() as i32,
+                            bounds.height.round() as i32
+                        );
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(
+                            bounds.x, bounds.y,
+                        )));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                            bounds.width.max(160.0),
+                            bounds.height.max(90.0),
+                        )));
+                    }
+                }
+                self.tracked_window = None;
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             return;
         };
