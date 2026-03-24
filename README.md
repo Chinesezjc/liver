@@ -58,10 +58,10 @@ cargo run -- --follow-window
 ## macOS 说明
 
 - macOS 默认启用“自动追踪前台窗口”，弹幕层会跟随当前最前面的应用窗口移动和缩放。
-- macOS 的 `--follow-window` 现在默认优先走原生 helper panel 路线：独立 `NSPanel + WKWebView` 承载透明弹幕层，更接近腾讯会议这类会议软件的 overlay 形态。
+- macOS 的 `--follow-window` 现在默认优先走原生 helper window 路线：独立 `NSWindow + WKWebView` 承载透明弹幕层，目的是更接近腾讯会议这类会议软件在原生全屏上的 overlay 形态。
 - macOS 的窗口跟随优先基于 Quartz / Window Server 的具体窗口实体（`CGWindowID`）同步 bounds，而不是只按前台应用做模糊匹配。
-- helper panel 会加入所有 Space，并作为全屏辅助窗口显示；这一步主要是为了尽量贴近会议软件在 macOS 上的 overlay 行为。
-- macOS 悬浮层默认会尝试使用更高的 `screen saver` 级别窗口层级；如果想临时回退，可以用 `DANMAKU_MACOS_WINDOW_LEVEL=26 cargo run -- --follow-window` 做对比测试。
+- helper window 会跟随活动 Space 变化，并尽量以全屏辅助窗口的方式参与显示；同时会尽量加入其他应用的 Space / 全屏集合。如果你想切回相对保守的 helper panel 路线，可以执行：`DANMAKU_MACOS_HELPER_WINDOW_KIND=panel cargo run -- --follow-window`
+- macOS 悬浮层默认会尝试使用更高的 assistive-tech 级别窗口层级；如果想临时回退做对比，可以用 `DANMAKU_MACOS_WINDOW_LEVEL=1000 cargo run -- --follow-window` 或 `DANMAKU_MACOS_WINDOW_LEVEL=26 cargo run -- --follow-window`
 - 如果你想临时回退到旧的 `eframe` 路线，可以执行：`DANMAKU_MACOS_OVERLAY_BACKEND=eframe cargo run -- --follow-window`
 - 首次使用 `--follow-window` 时，macOS 可能会弹出“辅助功能（Accessibility）”授权提示。请允许当前终端或该应用，否则系统不会把全屏窗口的焦点与位置提供给程序。
 - 为了让 Quartz 的窗口列表在原生全屏场景下更稳定，macOS 也建议授予“屏幕录制（Screen Recording）”权限；未授权时，`CGWindowListCopyWindowInfo` 返回的窗口元数据可能被系统过滤。

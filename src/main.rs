@@ -863,10 +863,18 @@ unsafe impl Encode for NSRect {
 #[cfg(target_os = "macos")]
 struct MacNativeOverlayState {
     panel: *mut Object,
+    window_kind: MacHelperWindowKind,
     tracker: MacWindowTracker,
     tracked_window: Option<MacTrackedWindow>,
     fallback_bounds: MacWindowBounds,
     desktop_bottom: f32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacHelperWindowKind {
+    Window,
+    Panel,
 }
 
 #[cfg(target_os = "macos")]
@@ -877,6 +885,49 @@ fn macos_native_helper_overlay_enabled() -> bool {
             .as_deref(),
         Some("eframe" | "EFRAME")
     )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_helper_window_kind() -> MacHelperWindowKind {
+    match std::env::var("DANMAKU_MACOS_HELPER_WINDOW_KIND")
+        .ok()
+        .as_deref()
+    {
+        Some("panel" | "PANEL") => MacHelperWindowKind::Panel,
+        _ => MacHelperWindowKind::Window,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_helper_window_kind_label(kind: MacHelperWindowKind) -> &'static str {
+    match kind {
+        MacHelperWindowKind::Window => "window",
+        MacHelperWindowKind::Panel => "panel",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_helper_collection_behavior(window_kind: MacHelperWindowKind) -> usize {
+    const NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+    const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const NS_WINDOW_COLLECTION_BEHAVIOR_IGNORES_CYCLE: usize = 1 << 6;
+    const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS: usize = 1 << 18;
+
+    match window_kind {
+        MacHelperWindowKind::Window => {
+            NS_WINDOW_COLLECTION_BEHAVIOR_MOVE_TO_ACTIVE_SPACE
+                | NS_WINDOW_COLLECTION_BEHAVIOR_IGNORES_CYCLE
+                | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+                | NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS
+        }
+        MacHelperWindowKind::Panel => {
+            NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+                | NS_WINDOW_COLLECTION_BEHAVIOR_IGNORES_CYCLE
+                | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY
+                | NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_APPLICATIONS
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -893,6 +944,9 @@ fn run_macos_native_helper_overlay_blocking(
     let _: () = unsafe { msg_send![app, setActivationPolicy: 1isize] };
 
     let mut tracker = MacWindowTracker::new();
+    let window_kind = macos_helper_window_kind();
+    let helper_level = macos_overlay_window_level();
+    let helper_behavior = macos_helper_collection_behavior(window_kind);
     let tracked_window = tracker.poll_target();
     let fallback_bounds = macos_native_helper_fallback_bounds(selected_monitor);
     let desktop_bottom = macos_desktop_bottom_edge(monitors);
@@ -903,7 +957,10 @@ fn run_macos_native_helper_overlay_blocking(
     let initial_appkit_bounds = macos_top_left_to_appkit_bounds(initial_bounds, desktop_bottom);
 
     info!(
-        "starting macOS native helper overlay, url={}, initial_bounds=({}, {}) {}x{}",
+        "starting macOS native helper overlay, kind={}, level={}, behavior=0x{:x}, url={}, initial_bounds=({}, {}) {}x{}",
+        macos_helper_window_kind_label(window_kind),
+        helper_level,
+        helper_behavior,
         macos_native_helper_overlay_url(port),
         initial_bounds.x.round() as i32,
         initial_bounds.y.round() as i32,
@@ -919,11 +976,12 @@ fn run_macos_native_helper_overlay_blocking(
         initial_appkit_bounds.height.round() as i32
     );
 
-    let panel = macos_create_native_helper_panel(initial_appkit_bounds)?;
+    let panel = macos_create_native_helper_panel(window_kind, initial_appkit_bounds)?;
     macos_attach_native_helper_webview(panel, &macos_native_helper_overlay_url(port))?;
 
     let mut state = Box::new(MacNativeOverlayState {
         panel,
+        window_kind,
         tracker,
         tracked_window,
         fallback_bounds,
@@ -1001,31 +1059,49 @@ fn macos_desktop_bottom_edge(monitors: &[MonitorSpec]) -> f32 {
 
 #[cfg(target_os = "macos")]
 fn macos_create_native_helper_panel(
+    window_kind: MacHelperWindowKind,
     initial_bounds: MacWindowBounds,
 ) -> Result<*mut Object, String> {
     const NS_WINDOW_STYLE_MASK_BORDERLESS: usize = 0;
     const NS_WINDOW_STYLE_MASK_NONACTIVATING_PANEL: usize = 1 << 7;
     const NS_BACKING_STORE_BUFFERED: usize = 2;
 
-    let panel_alloc: *mut Object = unsafe { msg_send![class!(NSPanel), alloc] };
+    let window_class = match window_kind {
+        MacHelperWindowKind::Window => class!(NSWindow),
+        MacHelperWindowKind::Panel => class!(NSPanel),
+    };
+    let style_mask = match window_kind {
+        MacHelperWindowKind::Window => NS_WINDOW_STYLE_MASK_BORDERLESS,
+        MacHelperWindowKind::Panel => {
+            NS_WINDOW_STYLE_MASK_BORDERLESS | NS_WINDOW_STYLE_MASK_NONACTIVATING_PANEL
+        }
+    };
+
+    let panel_alloc: *mut Object = unsafe { msg_send![window_class, alloc] };
     if panel_alloc.is_null() {
-        return Err("failed to allocate NSPanel".to_string());
+        return Err(format!(
+            "failed to allocate macOS helper {}",
+            macos_helper_window_kind_label(window_kind)
+        ));
     }
 
     let panel: *mut Object = unsafe {
         msg_send![
             panel_alloc,
             initWithContentRect: ns_rect(0.0, 0.0, initial_bounds.width.max(160.0), initial_bounds.height.max(90.0))
-            styleMask: NS_WINDOW_STYLE_MASK_BORDERLESS | NS_WINDOW_STYLE_MASK_NONACTIVATING_PANEL
+            styleMask: style_mask
             backing: NS_BACKING_STORE_BUFFERED
             defer: false
         ]
     };
     if panel.is_null() {
-        return Err("failed to initialize NSPanel".to_string());
+        return Err(format!(
+            "failed to initialize macOS helper {}",
+            macos_helper_window_kind_label(window_kind)
+        ));
     }
 
-    macos_apply_native_helper_panel_style(panel);
+    macos_apply_native_helper_panel_style(panel, window_kind);
     macos_apply_native_helper_panel_bounds(panel, initial_bounds);
     Ok(panel)
 }
@@ -1094,19 +1170,13 @@ fn macos_attach_native_helper_webview(panel: *mut Object, url: &str) -> Result<(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_apply_native_helper_panel_style(panel: *mut Object) {
-    const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
-    const NS_WINDOW_COLLECTION_BEHAVIOR_IGNORES_CYCLE: usize = 1 << 6;
-    const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
-
+fn macos_apply_native_helper_panel_style(panel: *mut Object, window_kind: MacHelperWindowKind) {
     if panel.is_null() {
         return;
     }
 
     let clear_color: *mut Object = unsafe { msg_send![class!(NSColor), clearColor] };
-    let behavior = NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
-        | NS_WINDOW_COLLECTION_BEHAVIOR_IGNORES_CYCLE
-        | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY;
+    let behavior = macos_helper_collection_behavior(window_kind);
 
     unsafe {
         let _: () = msg_send![panel, setCollectionBehavior: behavior];
@@ -1115,10 +1185,16 @@ fn macos_apply_native_helper_panel_style(panel: *mut Object) {
         let _: () = msg_send![panel, setHasShadow: false];
         let _: () = msg_send![panel, setHidesOnDeactivate: false];
         let _: () = msg_send![panel, setIgnoresMouseEvents: true];
-        let _: () = msg_send![panel, setFloatingPanel: true];
-        let _: () = msg_send![panel, setBecomesKeyOnlyIfNeeded: true];
         let _: () = msg_send![panel, setReleasedWhenClosed: false];
         let _: () = msg_send![panel, setBackgroundColor: clear_color];
+        let _: () = msg_send![panel, setCanHide: false];
+        let _: () = msg_send![panel, setMovable: false];
+        let _: () = msg_send![panel, setMovableByWindowBackground: false];
+        let _: () = msg_send![panel, setExcludedFromWindowsMenu: true];
+        if matches!(window_kind, MacHelperWindowKind::Panel) {
+            let _: () = msg_send![panel, setFloatingPanel: true];
+            let _: () = msg_send![panel, setBecomesKeyOnlyIfNeeded: true];
+        }
     }
 }
 
@@ -1136,7 +1212,7 @@ fn macos_apply_native_helper_panel_bounds(panel: *mut Object, bounds: MacWindowB
 
 #[cfg(target_os = "macos")]
 fn macos_sync_native_helper_state(state: &mut MacNativeOverlayState) {
-    macos_apply_native_helper_panel_style(state.panel);
+    macos_apply_native_helper_panel_style(state.panel, state.window_kind);
 
     let next_target = state.tracker.poll_target();
     if let Some(target) = next_target {
@@ -1280,6 +1356,10 @@ type AXError = i32;
 type AXUIElementRef = *const c_void;
 #[cfg(target_os = "macos")]
 type AXValueRef = *const c_void;
+#[cfg(target_os = "macos")]
+type CGWindowLevel = i32;
+#[cfg(target_os = "macos")]
+type CGWindowLevelKey = i32;
 
 #[cfg(target_os = "macos")]
 const AX_ERROR_SUCCESS: AXError = 0;
@@ -1287,6 +1367,8 @@ const AX_ERROR_SUCCESS: AXError = 0;
 const AX_VALUE_TYPE_CGPOINT: u32 = 1;
 #[cfg(target_os = "macos")]
 const AX_VALUE_TYPE_CGSIZE: u32 = 2;
+#[cfg(target_os = "macos")]
+const K_CG_ASSISTIVE_TECH_HIGH_WINDOW_LEVEL_KEY: CGWindowLevelKey = 20;
 
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -1301,6 +1383,7 @@ unsafe extern "C" {
     ) -> AXError;
     fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     fn AXValueGetValue(value: AXValueRef, the_type: u32, value_ptr: *mut c_void) -> u8;
+    fn CGWindowLevelForKey(key: CGWindowLevelKey) -> CGWindowLevel;
 }
 
 #[cfg(target_os = "macos")]
@@ -2191,13 +2274,23 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
 
 #[cfg(target_os = "macos")]
 fn macos_overlay_window_level() -> isize {
-    const DEFAULT_SCREEN_SAVER_LEVEL: isize = 1000;
-
-    std::env::var("DANMAKU_MACOS_WINDOW_LEVEL")
+    if let Some(level) = std::env::var("DANMAKU_MACOS_WINDOW_LEVEL")
         .ok()
         .and_then(|value| value.parse::<isize>().ok())
         .filter(|value| (0..=5000).contains(value))
-        .unwrap_or(DEFAULT_SCREEN_SAVER_LEVEL)
+    {
+        return level;
+    }
+
+    // Ask CoreGraphics for the current Assistive Tech level instead of baking
+    // in a literal, so we stay aligned with the system on future macOS builds.
+    let system_level =
+        unsafe { CGWindowLevelForKey(K_CG_ASSISTIVE_TECH_HIGH_WINDOW_LEVEL_KEY) as isize };
+    if system_level > 0 {
+        system_level
+    } else {
+        1500
+    }
 }
 
 #[cfg(target_os = "macos")]
