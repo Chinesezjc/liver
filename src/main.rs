@@ -613,8 +613,20 @@ fn run_overlay_blocking(port: u16, monitor_index: Option<i32>, monitors: &[Monit
         "Liver Danmaku Overlay",
         native_options,
         Box::new(move |cc| {
-            configure_overlay_fonts(&cc.egui_ctx);
-            configure_macos_overlay_window(cc);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                configure_overlay_fonts(&cc.egui_ctx);
+            }))
+            .is_err()
+            {
+                warn!("overlay font init panicked; fallback to default egui fonts");
+            }
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                configure_macos_overlay_window(cc);
+            }))
+            .is_err()
+            {
+                warn!("macOS native overlay tuning panicked; fallback to standard window behavior");
+            }
             Ok(Box::new(OverlayApp::new(rx)))
         }),
     );
@@ -988,83 +1000,96 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
             .insert(0, key.clone());
     }
 
-    ctx.set_fonts(fonts);
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.set_fonts(fonts);
+    }))
+    .is_err()
+    {
+        warn!("failed to apply custom CJK fonts; fallback to default egui fonts");
+        return;
+    }
     let names: Vec<&str> = loaded.iter().map(|(_, path)| *path).collect();
     info!("overlay loaded CJK font(s): {}", names.join(", "));
 }
 
 #[cfg(target_os = "macos")]
 fn configure_macos_overlay_window(cc: &eframe::CreationContext<'_>) {
-    use objc::{msg_send, sel, sel_impl};
-    use objc::runtime::{Object, NO, YES};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        use objc::{msg_send, sel, sel_impl};
+        use objc::runtime::{Object, NO, YES};
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGShieldingWindowLevel() -> i32;
-        fn CGWindowLevelForKey(key: i32) -> i32;
-    }
-
-    let Ok(handle) = cc.window_handle() else {
-        warn!("failed to fetch macOS window handle");
-        return;
-    };
-
-    let ns_window = match handle.as_raw() {
-        RawWindowHandle::AppKit(appkit) => {
-            // raw-window-handle 0.6 exposes `ns_view`; fetch NSWindow from it.
-            let ns_view = appkit.ns_view.as_ptr() as *mut Object;
-            let window: *mut Object = unsafe { msg_send![ns_view, window] };
-            window
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGShieldingWindowLevel() -> i32;
+            fn CGWindowLevelForKey(key: i32) -> i32;
         }
-        _ => {
-            warn!("unexpected raw window handle on macOS");
+
+        let Ok(handle) = cc.window_handle() else {
+            warn!("failed to fetch macOS window handle");
+            return;
+        };
+
+        let ns_window = match handle.as_raw() {
+            RawWindowHandle::AppKit(appkit) => {
+                // raw-window-handle 0.6 exposes `ns_view`; fetch NSWindow from it.
+                let ns_view = appkit.ns_view.as_ptr() as *mut Object;
+                let window: *mut Object = unsafe { msg_send![ns_view, window] };
+                window
+            }
+            _ => {
+                warn!("unexpected raw window handle on macOS");
+                return;
+            }
+        };
+        if ns_window.is_null() {
+            warn!("failed to resolve NSWindow from NSView");
             return;
         }
-    };
-    if ns_window.is_null() {
-        warn!("failed to resolve NSWindow from NSView");
-        return;
+
+        // NSWindowCollectionBehavior flags:
+        // 1 << 0  -> CanJoinAllSpaces
+        // 1 << 1  -> MoveToActiveSpace
+        // 1 << 3  -> Transient
+        // 1 << 4  -> Stationary
+        // 1 << 8  -> FullScreenAuxiliary
+        const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+        const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+        const TRANSIENT: usize = 1 << 3;
+        const STATIONARY: usize = 1 << 4;
+        const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+
+        // CoreGraphics CGWindowLevelKey values.
+        const K_CG_FLOATING_WINDOW_LEVEL_KEY: i32 = 5;
+        const K_CG_OVERLAY_WINDOW_LEVEL_KEY: i32 = 15;
+
+        unsafe {
+            let current: usize = msg_send![ns_window, collectionBehavior];
+            let updated = current
+                | CAN_JOIN_ALL_SPACES
+                | MOVE_TO_ACTIVE_SPACE
+                | TRANSIENT
+                | STATIONARY
+                | FULL_SCREEN_AUXILIARY;
+            let _: () = msg_send![ns_window, setCollectionBehavior: updated];
+
+            // Tencent-style strategy: floating/overlay level + all-spaces/fullscreen auxiliary.
+            let floating = CGWindowLevelForKey(K_CG_FLOATING_WINDOW_LEVEL_KEY);
+            let overlay = CGWindowLevelForKey(K_CG_OVERLAY_WINDOW_LEVEL_KEY);
+            let shielding = CGShieldingWindowLevel() + 1;
+            let level = floating.max(overlay).max(shielding) as isize;
+            let _: () = msg_send![ns_window, setLevel: level];
+            let _: () = msg_send![ns_window, setIgnoresMouseEvents: YES];
+            let _: () = msg_send![ns_window, setHidesOnDeactivate: NO];
+            let _: () = msg_send![ns_window, orderFrontRegardless];
+        }
+
+        info!("configured macOS overlay window with floating/overlay all-spaces strategy");
+    }));
+
+    if result.is_err() {
+        warn!("macOS overlay window native tuning panicked; falling back to default overlay behavior");
     }
-
-    // NSWindowCollectionBehavior flags:
-    // 1 << 0  -> CanJoinAllSpaces
-    // 1 << 1  -> MoveToActiveSpace
-    // 1 << 3  -> Transient
-    // 1 << 4  -> Stationary
-    // 1 << 8  -> FullScreenAuxiliary
-    const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
-    const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
-    const TRANSIENT: usize = 1 << 3;
-    const STATIONARY: usize = 1 << 4;
-    const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
-
-    // CoreGraphics CGWindowLevelKey values.
-    const K_CG_FLOATING_WINDOW_LEVEL_KEY: i32 = 5;
-    const K_CG_OVERLAY_WINDOW_LEVEL_KEY: i32 = 15;
-
-    unsafe {
-        let current: usize = msg_send![ns_window, collectionBehavior];
-        let updated = current
-            | CAN_JOIN_ALL_SPACES
-            | MOVE_TO_ACTIVE_SPACE
-            | TRANSIENT
-            | STATIONARY
-            | FULL_SCREEN_AUXILIARY;
-        let _: () = msg_send![ns_window, setCollectionBehavior: updated];
-
-        // Tencent-style strategy: floating/overlay level + all-spaces/fullscreen auxiliary.
-        let floating = CGWindowLevelForKey(K_CG_FLOATING_WINDOW_LEVEL_KEY);
-        let overlay = CGWindowLevelForKey(K_CG_OVERLAY_WINDOW_LEVEL_KEY);
-        let shielding = CGShieldingWindowLevel() + 1;
-        let level = floating.max(overlay).max(shielding) as isize;
-        let _: () = msg_send![ns_window, setLevel: level];
-        let _: () = msg_send![ns_window, setIgnoresMouseEvents: YES];
-        let _: () = msg_send![ns_window, setHidesOnDeactivate: NO];
-        let _: () = msg_send![ns_window, orderFrontRegardless];
-    }
-
-    info!("configured macOS overlay window with floating/overlay all-spaces strategy");
 }
 
 #[cfg(not(target_os = "macos"))]
