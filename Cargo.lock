@@ -1936,6 +1936,8 @@ name = "liver"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "core-foundation 0.10.1",
+ "core-graphics",
  "display-info",
  "eframe",
  "egui",

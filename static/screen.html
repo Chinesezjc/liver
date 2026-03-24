@@ -4,6 +4,18 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>弹幕屏幕</title>
+  <script>
+    (() => {
+      const params = new URLSearchParams(location.search);
+      const root = document.documentElement;
+      if (params.get("overlay") === "helper" || params.get("transparent") === "1") {
+        root.dataset.overlayMode = "helper";
+      }
+      if (params.get("hud") === "0") {
+        root.dataset.hideHud = "1";
+      }
+    })();
+  </script>
   <style>
     :root {
       --bg-top: #0f172a;
@@ -24,12 +36,22 @@
       color: var(--text);
     }
 
+    html[data-overlay-mode="helper"],
+    html[data-overlay-mode="helper"] body {
+      background: transparent;
+    }
+
     #stage {
       position: fixed;
       inset: 0;
       overflow: hidden;
       background-image: radial-gradient(circle at 12% 20%, rgba(96, 165, 250, 0.16), transparent 30%),
                         radial-gradient(circle at 80% 65%, rgba(192, 132, 252, 0.16), transparent 35%);
+    }
+
+    html[data-overlay-mode="helper"] #stage {
+      background-image: none;
+      background: transparent;
     }
 
     .track {
@@ -70,6 +92,10 @@
     }
 
     #hud b { color: #86efac; }
+
+    html[data-hide-hud="1"] #hud {
+      display: none;
+    }
   </style>
 </head>
 <body>
@@ -79,9 +105,10 @@
   <script>
     const stage = document.getElementById("stage");
     const connEl = document.getElementById("conn");
+    const helperOverlayMode = document.documentElement.dataset.overlayMode === "helper";
 
     const TRACK_HEIGHT = 46;
-    const TOP_PADDING = 18;
+    const TOP_PADDING = helperOverlayMode ? 10 : 18;
     const FONT_MIN = 26;
     const FONT_MAX = 42;
 
