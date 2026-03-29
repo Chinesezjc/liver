@@ -877,6 +877,7 @@ struct MacNativeOverlayState {
     panel: *mut Object,
     attach_mode: OverlayAttachMode,
     window_kind: MacHelperWindowKind,
+    preferred_monitor_index: Option<usize>,
     monitors: Vec<MonitorSpec>,
     tracker: MacWindowTracker,
     tracked_window: Option<MacTrackedWindow>,
@@ -962,7 +963,13 @@ fn run_macos_native_helper_overlay_blocking(
     let window_kind = macos_helper_window_kind();
     let helper_level = macos_overlay_window_level();
     let helper_behavior = macos_helper_collection_behavior(window_kind);
-    let tracked_window = macos_poll_overlay_target(&mut tracker, attach_mode, monitors);
+    let preferred_monitor_index = selected_monitor.map(|monitor| monitor.index);
+    let tracked_window = macos_poll_overlay_target(
+        &mut tracker,
+        attach_mode,
+        monitors,
+        preferred_monitor_index,
+    );
     let fallback_bounds = macos_native_helper_fallback_bounds(selected_monitor);
     let desktop_bottom = macos_desktop_bottom_edge(monitors);
     let initial_bounds = tracked_window
@@ -998,6 +1005,7 @@ fn run_macos_native_helper_overlay_blocking(
         panel,
         attach_mode,
         window_kind,
+        preferred_monitor_index,
         monitors: monitors.to_vec(),
         tracker,
         tracked_window,
@@ -1099,6 +1107,7 @@ fn macos_rect_intersection_area(a: MacWindowBounds, b: MacWindowBounds) -> f32 {
 fn macos_snap_fullscreen_target_to_monitor(
     mut target: MacTrackedWindow,
     monitors: &[MonitorSpec],
+    preferred_monitor_index: Option<usize>,
 ) -> Option<MacTrackedWindow> {
     let window_area = (target.bounds.width * target.bounds.height).max(1.0);
     let mut best_monitor: Option<&MonitorSpec> = None;
@@ -1114,6 +1123,14 @@ fn macos_snap_fullscreen_target_to_monitor(
     }
 
     let monitor = best_monitor?;
+    // In follow-fullscreen mode, a selected monitor acts as an affinity guard:
+    // full-screen windows on other displays must not steal the overlay away.
+    if preferred_monitor_index
+        .map(|expected| expected != monitor.index)
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let monitor_bounds = macos_monitor_bounds(monitor);
     let monitor_area = (monitor_bounds.width * monitor_bounds.height).max(1.0);
     let monitor_coverage = best_overlap / monitor_area;
@@ -1142,13 +1159,20 @@ fn macos_poll_overlay_target(
     tracker: &mut MacWindowTracker,
     attach_mode: OverlayAttachMode,
     monitors: &[MonitorSpec],
+    preferred_monitor_index: Option<usize>,
 ) -> Option<MacTrackedWindow> {
     match attach_mode {
         OverlayAttachMode::Monitor => None,
         OverlayAttachMode::FrontmostWindow => tracker.poll_target(),
         OverlayAttachMode::FullscreenWindow => tracker
             .poll_frontmost_candidate()
-            .and_then(|target| macos_snap_fullscreen_target_to_monitor(target, monitors)),
+            .and_then(|target| {
+                macos_snap_fullscreen_target_to_monitor(
+                    target,
+                    monitors,
+                    preferred_monitor_index,
+                )
+            }),
     }
 }
 
@@ -1309,8 +1333,12 @@ fn macos_apply_native_helper_panel_bounds(panel: *mut Object, bounds: MacWindowB
 fn macos_sync_native_helper_state(state: &mut MacNativeOverlayState) {
     macos_apply_native_helper_panel_style(state.panel, state.window_kind);
 
-    let next_target =
-        macos_poll_overlay_target(&mut state.tracker, state.attach_mode, &state.monitors);
+    let next_target = macos_poll_overlay_target(
+        &mut state.tracker,
+        state.attach_mode,
+        &state.monitors,
+        state.preferred_monitor_index,
+    );
     if let Some(target) = next_target {
         let appkit_bounds = macos_top_left_to_appkit_bounds(target.bounds, state.desktop_bottom);
         let previous = state.tracked_window.clone();
@@ -1564,6 +1592,8 @@ struct OverlayApp {
     #[cfg(target_os = "macos")]
     monitors: Vec<MonitorSpec>,
     #[cfg(target_os = "macos")]
+    preferred_monitor_index: Option<usize>,
+    #[cfg(target_os = "macos")]
     window_tracker: Option<MacWindowTracker>,
     #[cfg(target_os = "macos")]
     tracked_window: Option<MacTrackedWindow>,
@@ -1752,6 +1782,8 @@ impl OverlayApp {
             #[cfg(target_os = "macos")]
             monitors,
             #[cfg(target_os = "macos")]
+            preferred_monitor_index: selected_monitor.as_ref().map(|monitor| monitor.index),
+            #[cfg(target_os = "macos")]
             window_tracker: overlay_attach_mode_uses_window_tracking(attach_mode)
                 .then(MacWindowTracker::new),
             #[cfg(target_os = "macos")]
@@ -1838,7 +1870,12 @@ impl OverlayApp {
             return;
         };
 
-        let next_target = macos_poll_overlay_target(tracker, self.attach_mode, &self.monitors);
+        let next_target = macos_poll_overlay_target(
+            tracker,
+            self.attach_mode,
+            &self.monitors,
+            self.preferred_monitor_index,
+        );
         let Some(target) = next_target else {
             if matches!(self.attach_mode, OverlayAttachMode::FullscreenWindow) {
                 if let Some(bounds) = self.fallback_bounds {
