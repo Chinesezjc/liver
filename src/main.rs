@@ -7,11 +7,11 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicPtr, Ordering},
-        mpsc, Arc, OnceLock,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -80,6 +80,8 @@ static MACOS_NS_WINDOW_HACKS_HINT_PRINTED: AtomicBool = AtomicBool::new(false);
 static MACOS_OVERLAY_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 #[cfg(target_os = "macos")]
 static MACOS_NATIVE_HELPER_STATE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+const QUICK_TUNNEL_MAX_ATTEMPTS: usize = 3;
+const QUICK_TUNNEL_RETRY_DELAYS_SECS: [u64; QUICK_TUNNEL_MAX_ATTEMPTS - 1] = [2, 5];
 
 #[derive(Clone)]
 struct AppState {
@@ -155,6 +157,51 @@ struct MonitorSpec {
     scale_factor: f32,
     is_primary: bool,
     name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelLaunchErrorKind {
+    CloudflareService,
+    LocalProcess,
+}
+
+#[derive(Debug, Clone)]
+struct TunnelLaunchError {
+    kind: TunnelLaunchErrorKind,
+    detail: String,
+}
+
+impl TunnelLaunchError {
+    fn cloudflare_service(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TunnelLaunchErrorKind::CloudflareService,
+            detail: detail.into(),
+        }
+    }
+
+    fn local(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TunnelLaunchErrorKind::LocalProcess,
+            detail: detail.into(),
+        }
+    }
+
+    fn is_cloudflare_service(&self) -> bool {
+        matches!(self.kind, TunnelLaunchErrorKind::CloudflareService)
+    }
+}
+
+impl std::fmt::Display for TunnelLaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct CloudflaredAttemptState {
+    connected: bool,
+    cloudflare_service_error: Option<String>,
+    last_error: Option<String>,
 }
 
 fn main() {
@@ -363,10 +410,6 @@ fn run_cloudflared_blocking(port: u16, edge_pref: EdgeIpPreference) {
     };
     info!("cloudflared edge-ip-version={}", edge_ip_version);
 
-    info!(
-        "starting cloudflared quick tunnel for http://127.0.0.1:{}",
-        port
-    );
     info!("if created, open client at: https://<random>.trycloudflare.com/client");
     let origin_cert = find_existing_origin_cert();
     if let Some(path) = origin_cert.as_ref() {
@@ -375,6 +418,43 @@ fn run_cloudflared_blocking(port: u16, edge_pref: EdgeIpPreference) {
         info!("no origin cert found, continue with quick tunnel (no login)");
     }
 
+    for attempt in 1..=QUICK_TUNNEL_MAX_ATTEMPTS {
+        TUNNEL_CONNECTED.store(false, Ordering::Relaxed);
+        info!(
+            "starting cloudflared quick tunnel for http://127.0.0.1:{} (attempt {}/{})",
+            port, attempt, QUICK_TUNNEL_MAX_ATTEMPTS
+        );
+
+        match run_cloudflared_attempt(port, edge_ip_version, origin_cert.clone()) {
+            Ok(()) => return,
+            Err(err) if err.is_cloudflare_service() && attempt < QUICK_TUNNEL_MAX_ATTEMPTS => {
+                let delay = quick_tunnel_retry_delay_secs(attempt);
+                warn!(
+                    "cloudflared quick tunnel attempt {}/{} failed because TryCloudflare returned a service-side error: {}",
+                    attempt, QUICK_TUNNEL_MAX_ATTEMPTS, err
+                );
+                warn!(
+                    "这看起来是 Cloudflare TryCloudflare 服务端异常，不是 liver 代码问题；{} 秒后自动重试...",
+                    delay
+                );
+                thread::sleep(Duration::from_secs(delay));
+            }
+            Err(err) if err.is_cloudflare_service() => {
+                panic!("{}", format_cloudflare_quick_tunnel_panic(&err));
+            }
+            Err(err) => {
+                error!("{}", err);
+                return;
+            }
+        }
+    }
+}
+
+fn run_cloudflared_attempt(
+    port: u16,
+    edge_ip_version: &str,
+    origin_cert: Option<PathBuf>,
+) -> Result<(), TunnelLaunchError> {
     let mut cmd = Command::new("cloudflared");
     cmd.arg("tunnel")
         .arg("--url")
@@ -394,41 +474,140 @@ fn run_cloudflared_blocking(port: u16, edge_pref: EdgeIpPreference) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
-            error!("failed to start cloudflared: {}", err);
-            return;
+            return Err(TunnelLaunchError::local(format!(
+                "failed to start cloudflared: {}",
+                err
+            )));
         }
     };
 
     let out = child.stdout.take();
     let err = child.stderr.take();
+    let attempt_state = Arc::new(Mutex::new(CloudflaredAttemptState::default()));
+    let out_state = Arc::clone(&attempt_state);
+    let err_state = Arc::clone(&attempt_state);
 
     let out_handle = thread::spawn(move || {
         if let Some(stdout) = out {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                log_cloudflared_line(&line);
-                if let Some(url) = extract_trycloudflare_url(&line) {
-                    info!(target: "cloudflared", "client URL: {}/client", url);
-                }
-            }
+            pump_cloudflared_output(BufReader::new(stdout), out_state);
         }
     });
 
     let err_handle = thread::spawn(move || {
         if let Some(stderr) = err {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                log_cloudflared_line(&line);
-                if let Some(url) = extract_trycloudflare_url(&line) {
-                    info!(target: "cloudflared", "client URL: {}/client", url);
-                }
-            }
+            pump_cloudflared_output(BufReader::new(stderr), err_state);
         }
     });
 
-    let _ = child.wait();
+    let status = child.wait().map_err(|err| {
+        TunnelLaunchError::local(format!("failed while waiting for cloudflared: {}", err))
+    })?;
     let _ = out_handle.join();
     let _ = err_handle.join();
+
+    let state = lock_cloudflared_attempt_state(&attempt_state).clone();
+
+    if state.connected {
+        if !status.success() {
+            warn!(
+                target: "cloudflared",
+                "cloudflared exited after tunnel had connected: {}",
+                describe_exit_status(status)
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(detail) = state.cloudflare_service_error {
+        return Err(TunnelLaunchError::cloudflare_service(detail));
+    }
+
+    if let Some(detail) = state.last_error {
+        return Err(TunnelLaunchError::local(format!(
+            "cloudflared exited before tunnel connected: {}",
+            detail
+        )));
+    }
+
+    Err(TunnelLaunchError::local(format!(
+        "cloudflared exited before tunnel connected with {}",
+        describe_exit_status(status)
+    )))
+}
+
+fn pump_cloudflared_output<R: BufRead>(
+    reader: R,
+    attempt_state: Arc<Mutex<CloudflaredAttemptState>>,
+) {
+    for line in reader.lines().map_while(Result::ok) {
+        log_cloudflared_line(&line);
+        if let Some(url) = extract_trycloudflare_url(&line) {
+            info!(target: "cloudflared", "client URL: {}/client", url);
+        }
+        record_cloudflared_attempt_line(&attempt_state, &line);
+    }
+}
+
+fn record_cloudflared_attempt_line(
+    attempt_state: &Arc<Mutex<CloudflaredAttemptState>>,
+    line: &str,
+) {
+    let (_, msg) = split_cloudflared_line(line);
+    let mut state = lock_cloudflared_attempt_state(attempt_state);
+
+    if msg.contains("Registered tunnel connection") {
+        state.connected = true;
+    }
+
+    if let Some(detail) = classify_cloudflare_quick_tunnel_error(line, msg) {
+        state.cloudflare_service_error.get_or_insert(detail);
+    }
+
+    if line.contains(" ERR ") || line.starts_with("ERR ") {
+        state.last_error = Some(msg.to_string());
+    }
+}
+
+fn classify_cloudflare_quick_tunnel_error(line: &str, msg: &str) -> Option<String> {
+    if line.contains("Error unmarshaling QuickTunnel response")
+        || line.contains("failed to unmarshal quick Tunnel")
+    {
+        return Some(format!(
+            "TryCloudflare returned an invalid Quick Tunnel response: {}",
+            msg
+        ));
+    }
+
+    None
+}
+
+fn quick_tunnel_retry_delay_secs(attempt: usize) -> u64 {
+    QUICK_TUNNEL_RETRY_DELAYS_SECS
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .unwrap_or(5)
+}
+
+fn format_cloudflare_quick_tunnel_panic(err: &TunnelLaunchError) -> String {
+    format!(
+        "Cloudflare Quick Tunnel 连续 {} 次启动失败：{}。这是 Cloudflare TryCloudflare 服务端问题，不是 liver 代码问题。请稍后重试，或改用登录后的 named tunnel。",
+        QUICK_TUNNEL_MAX_ATTEMPTS, err
+    )
+}
+
+fn describe_exit_status(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {}", code),
+        None => "signal termination".to_string(),
+    }
+}
+
+fn lock_cloudflared_attempt_state(
+    attempt_state: &Arc<Mutex<CloudflaredAttemptState>>,
+) -> std::sync::MutexGuard<'_, CloudflaredAttemptState> {
+    attempt_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn find_existing_origin_cert() -> Option<PathBuf> {
@@ -964,12 +1143,8 @@ fn run_macos_native_helper_overlay_blocking(
     let helper_level = macos_overlay_window_level();
     let helper_behavior = macos_helper_collection_behavior(window_kind);
     let preferred_monitor_index = selected_monitor.map(|monitor| monitor.index);
-    let tracked_window = macos_poll_overlay_target(
-        &mut tracker,
-        attach_mode,
-        monitors,
-        preferred_monitor_index,
-    );
+    let tracked_window =
+        macos_poll_overlay_target(&mut tracker, attach_mode, monitors, preferred_monitor_index);
     let fallback_bounds = macos_native_helper_fallback_bounds(selected_monitor);
     let desktop_bottom = macos_desktop_bottom_edge(monitors);
     let initial_bounds = tracked_window
@@ -1164,15 +1339,11 @@ fn macos_poll_overlay_target(
     match attach_mode {
         OverlayAttachMode::Monitor => None,
         OverlayAttachMode::FrontmostWindow => tracker.poll_target(),
-        OverlayAttachMode::FullscreenWindow => tracker
-            .poll_frontmost_candidate()
-            .and_then(|target| {
-                macos_snap_fullscreen_target_to_monitor(
-                    target,
-                    monitors,
-                    preferred_monitor_index,
-                )
-            }),
+        OverlayAttachMode::FullscreenWindow => {
+            tracker.poll_frontmost_candidate().and_then(|target| {
+                macos_snap_fullscreen_target_to_monitor(target, monitors, preferred_monitor_index)
+            })
+        }
     }
 }
 
